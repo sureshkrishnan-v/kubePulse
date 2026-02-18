@@ -25,24 +25,10 @@ struct {
   __uint(max_entries, RINGBUF_SIZE);
 } drop_events SEC(".maps");
 
-// Tracepoint context for skb/kfree_skb
-struct trace_event_raw_kfree_skb_ctx {
-  unsigned short common_type;
-  unsigned char common_flags;
-  unsigned char common_preempt_count;
-  int common_pid;
-  void *skbaddr;
-  void *location;
-  unsigned short protocol;
-  unsigned short _pad;
-  unsigned int reason; // enum skb_drop_reason
-};
-
+// Uses vmlinux.h struct: trace_event_raw_kfree_skb
 SEC("tracepoint/skb/kfree_skb")
-int tracepoint_kfree_skb(struct trace_event_raw_kfree_skb_ctx *ctx) {
-  // Only trace drops with a specific reason (0 = SKB_CONSUMED, 1 =
-  // SKB_DROP_REASON_NOT_SPECIFIED) We want drops with reason >= 2 (actual
-  // drops, not normal consumption)
+int tracepoint_kfree_skb(struct trace_event_raw_kfree_skb *ctx) {
+  // Only trace actual drops (reason >= 2), not normal consumption
   if (ctx->reason < 2)
     return 0;
 

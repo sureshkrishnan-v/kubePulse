@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"sync/atomic"
 
 	"github.com/cilium/ebpf/ringbuf"
@@ -75,10 +74,4 @@ func (tp *TCPProbe) Run(ctx context.Context) error {
 // DroppedCount returns the total number of events dropped due to ring buffer overflow.
 func (tp *TCPProbe) DroppedCount() uint64 {
 	return tp.droppedCount.Load()
-}
-
-// FormatIPv4 converts a uint32 IPv4 address to dotted-decimal string.
-func FormatIPv4(ip uint32) string {
-	return fmt.Sprintf("%d.%d.%d.%d",
-		byte(ip), byte(ip>>8), byte(ip>>16), byte(ip>>24))
 }

@@ -1,0 +1,136 @@
+# KubePulse Alerting Rules
+# Deploy as a PrometheusRule CRD or include in Prometheus config.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kubepulse-alerts
+  labels:
+    app: kubepulse
+    prometheus: kube-prometheus
+spec:
+  groups:
+    - name: kubepulse.network
+      interval: 30s
+      rules:
+        # High TCP connection latency
+        - alert: KubePulseHighTCPLatency
+          expr: histogram_quantile(0.95, sum(rate(kubepulse_tcp_latency_seconds_bucket[5m])) by (le, namespace, pod)) > 0.5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High TCP latency in {{ $labels.namespace }}/{{ $labels.pod }}"
+            description: "TCP p95 latency is {{ $value | humanizeDuration }} (>500ms) for the last 5 minutes."
+
+        # Excessive TCP retransmissions
+        - alert: KubePulseHighRetransmits
+          expr: sum(rate(kubepulse_tcp_retransmits_total[5m])) by (namespace, pod) > 10
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High TCP retransmissions in {{ $labels.namespace }}/{{ $labels.pod }}"
+            description: "{{ $value | humanize }}/s retransmissions detected — possible packet loss or network congestion."
+
+        # TCP connection resets spike
+        - alert: KubePulseHighTCPResets
+          expr: sum(rate(kubepulse_tcp_resets_total[5m])) by (namespace, pod) > 5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "TCP resets spike in {{ $labels.namespace }}/{{ $labels.pod }}"
+            description: "{{ $value | humanize }}/s TCP RSTs — possible firewall blocks or application crashes."
+
+        # High packet drops
+        - alert: KubePulseHighPacketDrops
+          expr: sum(rate(kubepulse_packet_drops_total[5m])) by (reason) > 10
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High packet drops (reason: {{ $labels.reason }})"
+            description: "{{ $value | humanize }}/s packets dropped with reason {{ $labels.reason }}."
+
+        # Netfilter-specific drops (firewall/network policy blocks)
+        - alert: KubePulseNetfilterDrops
+          expr: sum(rate(kubepulse_packet_drops_total{reason="NETFILTER_DROP"}[5m])) > 5
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Network policy blocking traffic"
+            description: "{{ $value | humanize }}/s packets dropped by Netfilter — check NetworkPolicy rules."
+
+    - name: kubepulse.dns
+      interval: 30s
+      rules:
+        # High DNS query latency
+        - alert: KubePulseHighDNSLatency
+          expr: histogram_quantile(0.95, sum(rate(kubepulse_dns_latency_seconds_bucket[5m])) by (le, namespace, pod)) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High DNS latency in {{ $labels.namespace }}/{{ $labels.pod }}"
+            description: "DNS p95 latency is {{ $value | humanizeDuration }} (>100ms) for the last 5 minutes."
+
+        # Excessive DNS queries
+        - alert: KubePulseHighDNSRate
+          expr: sum(rate(kubepulse_dns_queries_total[5m])) by (namespace, pod) > 100
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High DNS query rate in {{ $labels.namespace }}/{{ $labels.pod }}"
+            description: "{{ $value | humanize }}/s DNS queries — potential DNS loop or misconfigured resolver."
+
+    - name: kubepulse.system
+      interval: 30s
+      rules:
+        # OOM Kill detected
+        - alert: KubePulseOOMKill
+          expr: increase(kubepulse_oom_kills_total[5m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "OOM Kill in {{ $labels.namespace }}/{{ $labels.pod }}"
+            description: "The kernel OOM killer terminated a process. Increase memory limits or investigate memory leaks."
+
+        # Suspicious process execution
+        - alert: KubePulseHighExecRate
+          expr: sum(rate(kubepulse_process_execs_total[5m])) by (namespace, pod) > 10
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High process exec rate in {{ $labels.namespace }}/{{ $labels.pod }}"
+            description: "{{ $value | humanize }}/s process executions — possible shell fork bomb or suspicious activity."
+
+    - name: kubepulse.storage
+      interval: 30s
+      rules:
+        # Slow file I/O
+        - alert: KubePulseSlowFileIO
+          expr: histogram_quantile(0.95, sum(rate(kubepulse_fileio_latency_seconds_bucket[5m])) by (le, namespace, pod, op)) > 1.0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Slow file I/O in {{ $labels.namespace }}/{{ $labels.pod }}"
+            description: "File {{ $labels.op }} p95 latency is {{ $value | humanizeDuration }} (>1s). Check disk performance and I/O limits."
+
+    - name: kubepulse.internal
+      interval: 60s
+      rules:
+        # KubePulse event drops
+        - alert: KubePulseEventDrops
+          expr: sum(rate(kubepulse_events_dropped_total[5m])) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "KubePulse dropping events"
+            description: "Ring buffer overflow — increase buffer sizes or reduce event volume."

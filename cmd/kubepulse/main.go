@@ -1,7 +1,7 @@
-// KubePulse - eBPF-powered Kubernetes-aware TCP latency and DNS monitoring agent.
+// KubePulse - eBPF-powered Kubernetes-aware observability agent.
 //
-// Phase 4: Full-featured agent with TCP/DNS tracing, Prometheus metrics,
-// and Kubernetes metadata enrichment (PID → pod/namespace labels).
+// Probes: TCP latency, DNS queries, TCP retransmissions, TCP resets,
+// OOM kills, process execs, file I/O latency, packet drops.
 package main
 
 import (
@@ -24,7 +24,7 @@ import (
 
 const (
 	defaultMetricsAddr = ":9090"
-	version            = "0.4.0"
+	version            = "2.0.0"
 )
 
 func main() {
@@ -41,15 +41,18 @@ func main() {
 
 	logger.Info("KubePulse starting",
 		zap.String("version", version),
-		zap.String("phase", "4-kubernetes-metadata"))
+		zap.Int("probes", 8))
 
-	// Determine metrics listen address
 	metricsAddr := os.Getenv("KUBEPULSE_METRICS_ADDR")
 	if metricsAddr == "" {
 		metricsAddr = defaultMetricsAddr
 	}
 
-	// Context with signal-based cancellation for graceful shutdown
+	nodeName := os.Getenv("KUBEPULSE_NODE_NAME")
+	if nodeName == "" {
+		nodeName, _ = os.Hostname()
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -60,118 +63,224 @@ func main() {
 	// Initialize metadata cache
 	metaCache := metadata.NewCache(metadata.DefaultCacheConfig())
 
-	// Node name for labels (from env, set by Kubernetes downward API)
-	nodeName := os.Getenv("KUBEPULSE_NODE_NAME")
-	if nodeName == "" {
-		nodeName, _ = os.Hostname()
-	}
-
-	// Try to start Kubernetes watcher (optional - may not be in a k8s cluster)
+	// Try to start Kubernetes watcher (optional)
 	k8sEnabled := false
 	k8sWatcher, err := metadata.NewK8sWatcher(metaCache, logger)
 	if err != nil {
-		logger.Warn("Kubernetes watcher not available (running outside cluster?)",
-			zap.Error(err))
+		logger.Warn("Kubernetes watcher not available", zap.Error(err))
 	} else {
 		k8sEnabled = true
 		go func() {
 			if err := k8sWatcher.Run(ctx); err != nil && ctx.Err() == nil {
-				logger.Error("Kubernetes watcher exited with error", zap.Error(err))
+				logger.Error("Kubernetes watcher error", zap.Error(err))
 			}
 		}()
 	}
 
-	// Load BPF programs and attach kprobes
-	logger.Info("Loading eBPF programs and attaching kprobes...")
+	// Load all BPF programs
+	logger.Info("Loading eBPF programs...")
 	lp, err := loader.Load()
 	if err != nil {
 		logger.Fatal("Failed to load eBPF programs", zap.Error(err))
 	}
 	defer lp.Close()
-	logger.Info("eBPF programs loaded and kprobes attached successfully",
-		zap.Strings("probes", []string{"tcp_connect", "tcp_close", "udp_sendmsg"}),
-		zap.Bool("k8s_enabled", k8sEnabled))
+	logger.Info("All eBPF programs loaded",
+		zap.Bool("k8s", k8sEnabled),
+		zap.Strings("probes", []string{
+			"tcp_connect", "tcp_close", "udp_sendmsg",
+			"tcp_retransmit_skb", "tcp_send_reset",
+			"oom/mark_victim", "sched_process_exec",
+			"vfs_read", "vfs_write", "kfree_skb",
+		}))
 
-	// TCP event handler: enriches with metadata + records Prometheus metrics
-	handleTCPEvent := func(event probes.TCPEvent) {
-		latencyMs := float64(event.LatencyNs) / 1e6
+	// Helper: resolve PID to pod metadata
+	resolvePod := func(pid uint32) (string, string) {
+		if meta, found := metaCache.Lookup(pid); found {
+			return meta.Namespace, meta.PodName
+		}
+		return "", ""
+	}
+
+	// ==================== Event Handlers ====================
+
+	// --- TCP Latency ---
+	handleTCP := func(event probes.TCPEvent) {
 		latencySec := float64(event.LatencyNs) / 1e9
-
-		// Resolve PID → pod/namespace metadata
-		podNs := ""
-		podName := ""
-		if meta, found := metaCache.Lookup(event.PID); found {
-			podNs = meta.Namespace
-			podName = meta.PodName
-		}
-
-		logger.Info("tcp_event",
+		ns, pod := resolvePod(event.PID)
+		logger.Info("tcp",
 			zap.Uint32("pid", event.PID),
 			zap.String("comm", event.CommString()),
-			zap.String("src", fmt.Sprintf("%s:%d",
-				probes.FormatIPv4(event.SAddr), event.SPort)),
-			zap.String("dst", fmt.Sprintf("%s:%d",
-				probes.FormatIPv4(event.DAddr), event.DPort)),
-			zap.Float64("latency_ms", latencyMs),
-			zap.String("latency_human", formatDuration(event.LatencyNs)),
-			zap.String("namespace", podNs),
-			zap.String("pod", podName),
-		)
-
-		m.ObserveTCPLatency(podNs, podName, nodeName, latencySec)
+			zap.String("src", fmt.Sprintf("%s:%d", probes.FormatIPv4(event.SAddr), event.SPort)),
+			zap.String("dst", fmt.Sprintf("%s:%d", probes.FormatIPv4(event.DAddr), event.DPort)),
+			zap.String("latency", formatDuration(event.LatencyNs)),
+			zap.String("ns", ns), zap.String("pod", pod))
+		m.ObserveTCPLatency(ns, pod, nodeName, latencySec)
 	}
 
-	// DNS event handler: enriches with metadata + records Prometheus metrics
-	handleDNSEvent := func(event probes.DNSEvent) {
-		qname := event.QNameString()
-		domain := kubemetrics.TruncateDomain(qname)
-
-		// Resolve PID → pod/namespace metadata
-		podNs := ""
-		podName := ""
-		if meta, found := metaCache.Lookup(event.PID); found {
-			podNs = meta.Namespace
-			podName = meta.PodName
-		}
-
-		logger.Info("dns_event",
+	// --- DNS ---
+	handleDNS := func(event probes.DNSEvent) {
+		domain := kubemetrics.TruncateDomain(event.QNameString())
+		ns, pod := resolvePod(event.PID)
+		logger.Info("dns",
 			zap.Uint32("pid", event.PID),
 			zap.String("comm", event.CommString()),
-			zap.String("query", qname),
+			zap.String("query", event.QNameString()),
 			zap.String("domain", domain),
-			zap.String("dns_server", fmt.Sprintf("%s:%d",
-				probes.FormatIPv4(event.DAddr), event.DPort)),
-			zap.String("namespace", podNs),
-			zap.String("pod", podName),
-		)
-
-		m.ObserveDNSQuery(podNs, podName, domain, nodeName)
+			zap.String("ns", ns), zap.String("pod", pod))
+		m.ObserveDNSQuery(ns, pod, domain, nodeName)
 	}
 
-	// Start TCP probe consumer
-	tcpProbe := probes.NewTCPProbe(lp.TCPReader, logger, handleTCPEvent)
-	go func() {
-		if err := tcpProbe.Run(ctx); err != nil && ctx.Err() == nil {
-			logger.Error("TCP probe exited with error", zap.Error(err))
-			cancel()
-		}
-	}()
+	// --- TCP Retransmit ---
+	handleRetransmit := func(event probes.RetransmitEvent) {
+		ns, pod := resolvePod(event.PID)
+		logger.Warn("tcp_retransmit",
+			zap.Uint32("pid", event.PID),
+			zap.String("comm", event.CommString()),
+			zap.String("src", fmt.Sprintf("%s:%d", probes.FormatIPv4(event.SAddr), event.SPort)),
+			zap.String("dst", fmt.Sprintf("%s:%d", probes.FormatIPv4(event.DAddr), event.DPort)),
+			zap.String("ns", ns), zap.String("pod", pod))
+		m.ObserveRetransmit(ns, pod, nodeName)
+	}
 
-	// Start DNS probe consumer
-	dnsProbe := probes.NewDNSProbe(lp.DNSReader, logger, handleDNSEvent)
-	go func() {
-		if err := dnsProbe.Run(ctx); err != nil && ctx.Err() == nil {
-			logger.Error("DNS probe exited with error", zap.Error(err))
-			cancel()
-		}
-	}()
+	// --- TCP RST ---
+	handleRST := func(event probes.RSTEvent) {
+		ns, pod := resolvePod(event.PID)
+		logger.Warn("tcp_rst",
+			zap.Uint32("pid", event.PID),
+			zap.String("comm", event.CommString()),
+			zap.String("src", fmt.Sprintf("%s:%d", probes.FormatIPv4(event.SAddr), event.SPort)),
+			zap.String("dst", fmt.Sprintf("%s:%d", probes.FormatIPv4(event.DAddr), event.DPort)),
+			zap.Uint32("state", event.State),
+			zap.String("ns", ns), zap.String("pod", pod))
+		m.ObserveReset(ns, pod, nodeName)
+	}
 
-	// Start metrics exporter HTTP server
+	// --- OOM Kill ---
+	handleOOM := func(event probes.OOMEvent) {
+		ns, pod := resolvePod(event.PID)
+		logger.Error("oom_kill",
+			zap.Uint32("pid", event.PID),
+			zap.String("comm", event.CommString()),
+			zap.Uint64("total_vm_kb", event.TotalVMKB()),
+			zap.Uint64("anon_rss_pages", event.AnonRSS),
+			zap.Int16("oom_score_adj", event.OOMScoreAdj),
+			zap.String("ns", ns), zap.String("pod", pod))
+		m.ObserveOOMKill(ns, pod, nodeName)
+	}
+
+	// --- Process Exec ---
+	handleExec := func(event probes.ExecEvent) {
+		ns, pod := resolvePod(event.PID)
+		logger.Info("exec",
+			zap.Uint32("pid", event.PID),
+			zap.String("comm", event.CommString()),
+			zap.String("filename", event.FilenameString()),
+			zap.String("ns", ns), zap.String("pod", pod))
+		m.ObserveExec(ns, pod, nodeName)
+	}
+
+	// --- File I/O ---
+	handleFileIO := func(event probes.FileIOEvent) {
+		latencySec := float64(event.LatencyNs) / 1e9
+		ns, pod := resolvePod(event.PID)
+		op := event.OpString()
+		logger.Info("fileio",
+			zap.Uint32("pid", event.PID),
+			zap.String("comm", event.CommString()),
+			zap.String("op", op),
+			zap.Uint64("bytes", event.Bytes),
+			zap.String("latency", formatDuration(event.LatencyNs)),
+			zap.String("ns", ns), zap.String("pod", pod))
+		m.ObserveFileIO(ns, pod, op, nodeName, latencySec)
+	}
+
+	// --- Packet Drop ---
+	handleDrop := func(event probes.DropEvent) {
+		reason := event.DropReasonString()
+		logger.Warn("packet_drop",
+			zap.Uint32("pid", event.PID),
+			zap.String("comm", event.CommString()),
+			zap.String("reason", reason),
+			zap.Uint16("protocol", event.Protocol))
+		m.ObservePacketDrop(reason, nodeName)
+	}
+
+	// ==================== Start Probes ====================
+
+	type probeRunner struct {
+		name string
+		run  func()
+	}
+
+	runners := []probeRunner{
+		{"tcp", func() {
+			p := probes.NewTCPProbe(lp.TCPReader, logger, handleTCP)
+			if err := p.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("TCP probe error", zap.Error(err))
+				cancel()
+			}
+		}},
+		{"dns", func() {
+			p := probes.NewDNSProbe(lp.DNSReader, logger, handleDNS)
+			if err := p.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("DNS probe error", zap.Error(err))
+				cancel()
+			}
+		}},
+		{"retransmit", func() {
+			p := probes.NewRetransmitProbe(lp.RetransmitReader, logger, handleRetransmit)
+			if err := p.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("Retransmit probe error", zap.Error(err))
+				cancel()
+			}
+		}},
+		{"rst", func() {
+			p := probes.NewRSTProbe(lp.RSTReader, logger, handleRST)
+			if err := p.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("RST probe error", zap.Error(err))
+				cancel()
+			}
+		}},
+		{"oom", func() {
+			p := probes.NewOOMProbe(lp.OOMReader, logger, handleOOM)
+			if err := p.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("OOM probe error", zap.Error(err))
+				cancel()
+			}
+		}},
+		{"exec", func() {
+			p := probes.NewExecProbe(lp.ExecReader, logger, handleExec)
+			if err := p.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("Exec probe error", zap.Error(err))
+				cancel()
+			}
+		}},
+		{"fileio", func() {
+			p := probes.NewFileIOProbe(lp.FileIOReader, logger, handleFileIO)
+			if err := p.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("FileIO probe error", zap.Error(err))
+				cancel()
+			}
+		}},
+		{"drop", func() {
+			p := probes.NewDropProbe(lp.DropReader, logger, handleDrop)
+			if err := p.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("Drop probe error", zap.Error(err))
+				cancel()
+			}
+		}},
+	}
+
+	for _, r := range runners {
+		go r.run()
+	}
+
+	// Start metrics exporter
 	exp := exporter.New(metricsAddr, logger)
 	exp.SetReady()
 	go func() {
 		if err := exp.Run(ctx); err != nil && ctx.Err() == nil {
-			logger.Error("Metrics exporter exited with error", zap.Error(err))
+			logger.Error("Metrics exporter error", zap.Error(err))
 			cancel()
 		}
 	}()
@@ -179,24 +288,19 @@ func main() {
 	logger.Info("KubePulse is running",
 		zap.String("metrics", metricsAddr+"/metrics"),
 		zap.String("node", nodeName),
-		zap.Bool("k8s_metadata", k8sEnabled))
+		zap.Bool("k8s", k8sEnabled),
+		zap.Int("active_probes", len(runners)))
 
-	// Block until shutdown signal
 	<-ctx.Done()
 	logger.Info("Shutdown signal received, cleaning up...")
-
-	// Give a brief moment for in-flight events
 	time.Sleep(100 * time.Millisecond)
 
 	pidEntries, containerEntries := metaCache.Stats()
 	logger.Info("KubePulse stopped",
-		zap.Uint64("tcp_events_dropped", tcpProbe.DroppedCount()),
-		zap.Uint64("dns_events_dropped", dnsProbe.DroppedCount()),
 		zap.Int("cached_pids", pidEntries),
 		zap.Int("cached_containers", containerEntries))
 }
 
-// formatDuration converts nanoseconds to a human-readable duration string.
 func formatDuration(ns uint64) string {
 	d := time.Duration(ns) * time.Nanosecond
 	switch {

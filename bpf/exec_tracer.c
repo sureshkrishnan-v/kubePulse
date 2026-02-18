@@ -25,20 +25,10 @@ struct {
   __uint(max_entries, RINGBUF_SIZE);
 } exec_events SEC(".maps");
 
-// Tracepoint context for sched/sched_process_exec
-struct trace_event_raw_sched_process_exec_ctx {
-  unsigned short common_type;
-  unsigned char common_flags;
-  unsigned char common_preempt_count;
-  int common_pid;
-  int __data_loc_filename;
-  int pid;
-  int old_pid;
-};
-
+// Uses vmlinux.h struct: trace_event_raw_sched_process_exec
 SEC("tracepoint/sched/sched_process_exec")
 int tracepoint_sched_process_exec(
-    struct trace_event_raw_sched_process_exec_ctx *ctx) {
+    struct trace_event_raw_sched_process_exec *ctx) {
   struct exec_event *event;
 
   event = bpf_ringbuf_reserve(&exec_events, sizeof(*event), 0);
@@ -52,7 +42,7 @@ int tracepoint_sched_process_exec(
   bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
   // Read filename from __data_loc encoded field
-  // __data_loc format: lower 16 bits = offset, upper 16 bits = length
+  // __data_loc: lower 16 bits = offset, upper 16 bits = length
   unsigned short fname_off = ctx->__data_loc_filename & 0xFFFF;
   unsigned short fname_len = (ctx->__data_loc_filename >> 16) & 0xFFFF;
   if (fname_len > MAX_FILENAME_LEN)

@@ -29,23 +29,7 @@ struct {
   __uint(max_entries, RINGBUF_SIZE);
 } oom_events SEC(".maps");
 
-// Tracepoint context struct for oom/mark_victim
-struct trace_event_raw_mark_victim {
-  unsigned short common_type;
-  unsigned char common_flags;
-  unsigned char common_preempt_count;
-  int common_pid;
-  int pid;
-  int __data_loc_comm;
-  unsigned long total_vm;
-  unsigned long anon_rss;
-  unsigned long file_rss;
-  unsigned long shmem_rss;
-  uid_t uid;
-  unsigned long pgtables;
-  short oom_score_adj;
-};
-
+// Use the vmlinux.h struct: trace_event_raw_mark_victim
 SEC("tracepoint/oom/mark_victim")
 int tracepoint_oom_mark_victim(struct trace_event_raw_mark_victim *ctx) {
   struct oom_event *event;

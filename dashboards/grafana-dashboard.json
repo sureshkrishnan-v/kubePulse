@@ -1,0 +1,167 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Active Probes",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "targets": [{"expr": "count(kubepulse_events_total)", "legendFormat": "Probes"}],
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "green", "value": null}]}}}
+    },
+    {
+      "title": "Events / sec",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "targets": [{"expr": "sum(rate(kubepulse_events_total[5m]))", "legendFormat": "Events/s"}],
+      "fieldConfig": {"defaults": {"unit": "ops", "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1000}, {"color": "red", "value": 5000}]}}}
+    },
+    {
+      "title": "OOM Kills",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "targets": [{"expr": "sum(kubepulse_oom_kills_total)", "legendFormat": "OOM Kills"}],
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}}
+    },
+    {
+      "title": "TCP Retransmits / min",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "targets": [{"expr": "sum(rate(kubepulse_tcp_retransmits_total[5m])) * 60", "legendFormat": "Retransmits/min"}],
+      "fieldConfig": {"defaults": {"unit": "short", "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 10}, {"color": "red", "value": 100}]}}}
+    },
+    {
+      "title": "Packet Drops / min",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+      "targets": [{"expr": "sum(rate(kubepulse_packet_drops_total[5m])) * 60", "legendFormat": "Drops/min"}],
+      "fieldConfig": {"defaults": {"unit": "short", "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 10}, {"color": "red", "value": 50}]}}}
+    },
+    {
+      "title": "TCP Resets / min",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+      "targets": [{"expr": "sum(rate(kubepulse_tcp_resets_total[5m])) * 60", "legendFormat": "Resets/min"}],
+      "fieldConfig": {"defaults": {"unit": "short", "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 5}, {"color": "red", "value": 50}]}}}
+    },
+    {
+      "title": "TCP Connection Latency",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum(rate(kubepulse_tcp_latency_seconds_bucket[5m])) by (le, namespace))", "legendFormat": "p50 {{namespace}}"},
+        {"expr": "histogram_quantile(0.95, sum(rate(kubepulse_tcp_latency_seconds_bucket[5m])) by (le, namespace))", "legendFormat": "p95 {{namespace}}"},
+        {"expr": "histogram_quantile(0.99, sum(rate(kubepulse_tcp_latency_seconds_bucket[5m])) by (le, namespace))", "legendFormat": "p99 {{namespace}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2, "fillOpacity": 10}}}
+    },
+    {
+      "title": "DNS Query Latency",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum(rate(kubepulse_dns_latency_seconds_bucket[5m])) by (le))", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, sum(rate(kubepulse_dns_latency_seconds_bucket[5m])) by (le))", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, sum(rate(kubepulse_dns_latency_seconds_bucket[5m])) by (le))", "legendFormat": "p99"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2, "fillOpacity": 10}}}
+    },
+    {
+      "title": "DNS Queries by Domain",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "targets": [
+        {"expr": "topk(10, sum(rate(kubepulse_dns_queries_total[5m])) by (domain))", "legendFormat": "{{domain}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"lineWidth": 2, "fillOpacity": 20, "gradientMode": "scheme"}}}
+    },
+    {
+      "title": "File I/O Latency",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum(rate(kubepulse_fileio_latency_seconds_bucket[5m])) by (le, op))", "legendFormat": "p95 {{op}}"},
+        {"expr": "histogram_quantile(0.99, sum(rate(kubepulse_fileio_latency_seconds_bucket[5m])) by (le, op))", "legendFormat": "p99 {{op}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"lineWidth": 2, "fillOpacity": 10}}}
+    },
+    {
+      "title": "TCP Retransmissions by Pod",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+      "targets": [
+        {"expr": "topk(10, sum(rate(kubepulse_tcp_retransmits_total[5m])) by (namespace, pod))", "legendFormat": "{{namespace}}/{{pod}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"lineWidth": 2, "fillOpacity": 10}}}
+    },
+    {
+      "title": "Packet Drops by Reason",
+      "type": "piechart",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+      "targets": [
+        {"expr": "sum(kubepulse_packet_drops_total) by (reason)", "legendFormat": "{{reason}}"}
+      ]
+    },
+    {
+      "title": "Process Executions by Pod",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28},
+      "targets": [
+        {"expr": "topk(10, sum(rate(kubepulse_process_execs_total[5m])) by (namespace, pod))", "legendFormat": "{{namespace}}/{{pod}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"lineWidth": 2, "fillOpacity": 10}}}
+    },
+    {
+      "title": "Events by Type",
+      "type": "barchart",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28},
+      "targets": [
+        {"expr": "sum(rate(kubepulse_events_total[5m])) by (type)", "legendFormat": "{{type}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops"}}
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 36,
+  "style": "dark",
+  "tags": ["kubepulse", "ebpf", "kubernetes"],
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(kubepulse_events_total, namespace)",
+        "includeAll": true,
+        "multi": true
+      },
+      {
+        "name": "node",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(kubepulse_events_total, node)",
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "time": {"from": "now-1h", "to": "now"},
+  "title": "KubePulse - eBPF Observability",
+  "uid": "kubepulse-overview",
+  "version": 1
+}
