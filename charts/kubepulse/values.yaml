@@ -1,0 +1,54 @@
+# KubePulse Helm Chart Values
+# Override these values when installing the chart.
+
+# Container image
+image:
+  repository: kubepulse
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+
+# Prometheus metrics exporter
+metrics:
+  port: 9090
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    scrapeTimeout: 10s
+
+# Resource limits per node
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+# Node selector for targeting specific nodes
+nodeSelector: {}
+
+# Tolerations for scheduling on tainted nodes (e.g., control plane)
+tolerations:
+  - operator: Exists
+
+# Pod annotations
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9090"
+  prometheus.io/path: "/metrics"
+
+# Namespace to deploy into
+namespace: kubepulse
+
+# Logging level
+logLevel: info
+
+# Security context
+securityContext:
+  privileged: true
+  capabilities:
+    add:
+      - SYS_ADMIN
+      - NET_ADMIN
+      - SYS_PTRACE
+      - BPF
