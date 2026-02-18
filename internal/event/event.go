@@ -5,6 +5,8 @@ package event
 import (
 	"sync"
 	"time"
+
+	"github.com/sureshkrishnan-v/kubePulse/internal/constants"
 )
 
 // EventType identifies the source module of an event.
@@ -26,21 +28,21 @@ const (
 func (t EventType) String() string {
 	switch t {
 	case TypeTCP:
-		return "tcp"
+		return constants.ModuleTCP
 	case TypeDNS:
-		return "dns"
+		return constants.ModuleDNS
 	case TypeRetransmit:
-		return "retransmit"
+		return constants.ModuleRetransmit
 	case TypeRST:
-		return "rst"
+		return constants.ModuleRST
 	case TypeOOM:
-		return "oom"
+		return constants.ModuleOOM
 	case TypeExec:
-		return "exec"
+		return constants.ModuleExec
 	case TypeFileIO:
-		return "fileio"
+		return constants.ModuleFileIO
 	case TypeDrop:
-		return "drop"
+		return constants.ModuleDrop
 	default:
 		return "unknown"
 	}
@@ -76,8 +78,8 @@ type Event struct {
 var pool = sync.Pool{
 	New: func() any {
 		return &Event{
-			Labels:  make(map[string]string, 4),
-			Numeric: make(map[string]float64, 4),
+			Labels:  make(map[string]string, constants.EventPoolMapCapacity),
+			Numeric: make(map[string]float64, constants.EventPoolMapCapacity),
 		}
 	},
 }
@@ -85,14 +87,12 @@ var pool = sync.Pool{
 // Acquire retrieves a pre-allocated Event from the pool.
 // The caller must call Release() when done processing the event.
 func Acquire() *Event {
-	e := pool.Get().(*Event)
-	return e
+	return pool.Get().(*Event)
 }
 
 // Release returns the Event to the pool after clearing all fields.
 // The event must not be used after calling Release.
 func (e *Event) Release() {
-	// Clear fields but keep allocated maps
 	e.Type = TypeUnknown
 	e.Timestamp = time.Time{}
 	e.PID = 0

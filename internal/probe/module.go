@@ -1,6 +1,10 @@
-// Package probe defines the Module interface that all KubePulse eBPF modules implement.
-// This is the core extension point — each module owns its BPF program lifecycle
-// and publishes events to the EventBus via Dependencies.
+// Package probe defines the Module interface — the contract for all
+// pluggable eBPF modules in KubePulse.
+//
+// Design patterns:
+//   - Strategy: each Module implementation encapsulates a specific BPF strategy
+//   - Dependency Injection: Dependencies struct injected during Init()
+//   - Template Method: Name/Init/Start/Stop lifecycle enforced by interface
 package probe
 
 import (
@@ -13,51 +17,54 @@ import (
 	"github.com/sureshkrishnan-v/kubePulse/internal/metadata"
 )
 
-// Module defines the lifecycle contract for a pluggable eBPF module.
+// Module is the lifecycle interface for all eBPF modules.
 //
-// Each module is responsible for:
-//   - Loading its BPF program into the kernel
-//   - Attaching hooks (kprobes, tracepoints)
-//   - Consuming ring buffer events
-//   - Enriching events with metadata
-//   - Publishing to EventBus
-//
-// Lifecycle: Init(ctx, deps) → Start(ctx) → Stop(ctx)
+// Lifecycle:
+//  1. Name() — returns unique module identifier
+//  2. Init(ctx, deps) — load BPF objects, attach hooks, create readers
+//  3. Start(ctx) — consume ring buffer events and publish to EventBus
+//  4. Stop(ctx) — release kernel resources within deadline
 type Module interface {
-	// Name returns a unique identifier for this module.
-	// Must match the config key (e.g., "tcp", "dns", "oom").
+	// Name returns a unique, human-readable identifier.
 	Name() string
 
-	// Init loads BPF programs, attaches hooks, and prepares ring buffers.
-	// Dependencies are injected here — the module stores them for later use.
+	// Init loads BPF programs, attaches hooks, creates ring buffer readers.
+	// Dependencies are injected here (DI pattern).
 	Init(ctx context.Context, deps Dependencies) error
 
-	// Start begins the event consumption loop.
-	// Must block until ctx is cancelled or an unrecoverable error occurs.
-	// Events are published to deps.EventBus (received in Init).
+	// Start begins consuming events from the ring buffer.
+	// Blocks until ctx is cancelled. Publishes to EventBus.
 	Start(ctx context.Context) error
 
-	// Stop gracefully shuts down the module.
-	// The ctx has a deadline — the module must finish within it.
-	// Releases all kernel resources (BPF objects, links, ring buffers).
+	// Stop releases all kernel resources within the context deadline.
 	Stop(ctx context.Context) error
 }
 
-// Dependencies provides all shared resources a module needs.
-// Injected during Init() — no global state, no constructor injection.
+// Dependencies holds all shared resources injected into modules.
+// This implements the Dependency Injection (DI) pattern — modules
+// declare what they need, the runtime provides it.
 type Dependencies struct {
-	// Logger for structured logging
-	Logger *zap.Logger
-
-	// Config for this specific module
-	Config *config.ModuleConfig
-
-	// EventBus for publishing events
+	Logger   *zap.Logger
+	Config   *config.ModuleConfig
 	EventBus *event.Bus
-
-	// Metadata cache for PID → pod/namespace resolution
 	Metadata *metadata.Cache
-
-	// NodeName for metric labels
 	NodeName string
+}
+
+// NewDependencies creates a Dependencies struct with all required fields.
+// This is the canonical constructor — never use a raw struct literal.
+func NewDependencies(
+	logger *zap.Logger,
+	cfg *config.ModuleConfig,
+	bus *event.Bus,
+	meta *metadata.Cache,
+	nodeName string,
+) Dependencies {
+	return Dependencies{
+		Logger:   logger,
+		Config:   cfg,
+		EventBus: bus,
+		Metadata: meta,
+		NodeName: nodeName,
+	}
 }

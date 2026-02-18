@@ -8,12 +8,12 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/cilium/ebpf/rlimit"
 	"go.uber.org/zap"
 
 	"github.com/sureshkrishnan-v/kubePulse/internal/config"
+	"github.com/sureshkrishnan-v/kubePulse/internal/constants"
 	"github.com/sureshkrishnan-v/kubePulse/internal/event"
 	"github.com/sureshkrishnan-v/kubePulse/internal/export"
 	"github.com/sureshkrishnan-v/kubePulse/internal/metadata"
@@ -23,6 +23,10 @@ import (
 // Runtime is the central orchestrator for KubePulse.
 // It manages the lifecycle of all modules, exporters, event bus,
 // metadata cache, and graceful shutdown.
+//
+// Design pattern: Facade — provides a single entry point (Run) that
+// orchestrates all subsystems. Also implements the Registry pattern
+// for module/exporter registration.
 type Runtime struct {
 	cfg       *config.Config
 	logger    *zap.Logger
@@ -33,27 +37,29 @@ type Runtime struct {
 }
 
 // NewRuntime creates a new Runtime with the given configuration.
+// The EventBus is created eagerly so exporters can subscribe before Run().
 func NewRuntime(cfg *config.Config, logger *zap.Logger) *Runtime {
 	return &Runtime{
 		cfg:    cfg,
 		logger: logger,
+		bus:    event.NewBus(cfg.Performance.EventBusBuffer, logger),
 	}
 }
 
-// RegisterModule adds a module to the runtime.
+// RegisterModule adds a module to the runtime (Registry pattern).
 // The module will only be initialized if enabled in config.
 // Must be called before Run.
 func (rt *Runtime) RegisterModule(m probe.Module) {
 	rt.modules = append(rt.modules, m)
 }
 
-// RegisterExporter adds an exporter to the runtime.
+// RegisterExporter adds an exporter to the runtime (Registry pattern).
 // Must be called before Run.
 func (rt *Runtime) RegisterExporter(e export.Exporter) {
 	rt.exporters = append(rt.exporters, e)
 }
 
-// EventBus returns the event bus (available after Run starts).
+// EventBus returns the event bus for exporter subscription.
 func (rt *Runtime) EventBus() *event.Bus {
 	return rt.bus
 }
@@ -65,13 +71,12 @@ func (rt *Runtime) MetaCache() *metadata.Cache {
 
 // Run starts the full runtime lifecycle:
 //  1. Pre-flight checks (root, rlimit)
-//  2. Create EventBus
-//  3. Init metadata cache + K8s watcher
-//  4. Init all enabled modules (skip disabled)
-//  5. Start exporters
-//  6. Start all initialized modules
-//  7. Wait for shutdown signal
-//  8. Stop modules → stop exporters → close bus
+//  2. Init metadata cache + K8s watcher
+//  3. Init all enabled modules (skip disabled)
+//  4. Start exporters
+//  5. Start all initialized modules
+//  6. Wait for shutdown signal
+//  7. Stop modules → close bus → stop exporters
 func (rt *Runtime) Run(ctx context.Context) error {
 	// Pre-flight checks
 	if os.Geteuid() != 0 {
@@ -85,9 +90,6 @@ func (rt *Runtime) Run(ctx context.Context) error {
 		zap.Int("modules_registered", len(rt.modules)),
 		zap.Int("exporters_registered", len(rt.exporters)),
 		zap.String("node", rt.cfg.Agent.NodeName))
-
-	// Create EventBus
-	rt.bus = event.NewBus(rt.cfg.Performance.EventBusBuffer, rt.logger)
 
 	// Initialize metadata cache
 	rt.metaCache = metadata.NewCache(metadata.DefaultCacheConfig())
@@ -108,17 +110,18 @@ func (rt *Runtime) Run(ctx context.Context) error {
 	var initialized []probe.Module
 	for _, m := range rt.modules {
 		if !rt.cfg.ModuleEnabled(m.Name()) {
-			rt.logger.Info("Module disabled by config — skipping", zap.String("module", m.Name()))
+			rt.logger.Info("Module disabled by config — skipping",
+				zap.String("module", m.Name()))
 			continue
 		}
 
-		deps := probe.Dependencies{
-			Logger:   rt.logger.Named(m.Name()),
-			Config:   rt.cfg.ModuleConf(m.Name()),
-			EventBus: rt.bus,
-			Metadata: rt.metaCache,
-			NodeName: rt.cfg.Agent.NodeName,
-		}
+		deps := probe.NewDependencies(
+			rt.logger.Named(m.Name()),
+			rt.cfg.ModuleConf(m.Name()),
+			rt.bus,
+			rt.metaCache,
+			rt.cfg.Agent.NodeName,
+		)
 
 		rt.logger.Info("Initializing module", zap.String("module", m.Name()))
 		if err := m.Init(ctx, deps); err != nil {
@@ -179,7 +182,7 @@ func (rt *Runtime) Run(ctx context.Context) error {
 	rt.logger.Info("Shutdown signal received")
 
 	// Stop modules (with timeout)
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), constants.ShutdownTimeout)
 	defer stopCancel()
 
 	for _, m := range initialized {
@@ -204,7 +207,6 @@ func (rt *Runtime) Run(ctx context.Context) error {
 
 	wg.Wait()
 
-	// Log final stats
 	rt.logger.Info("KubePulse stopped",
 		zap.Int("modules_stopped", len(initialized)),
 		zap.Uint64("events_published", rt.bus.Published()),

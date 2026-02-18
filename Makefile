@@ -1,37 +1,56 @@
 # KubePulse Makefile
-# Targets: generate (BPF → Go bindings), build, test, clean
+# Targets: generate, build (agent/consumer/api), test, clean, docker-up, dev-web
 
-BINARY  := bin/kubepulse
-CMD     := ./cmd/kubepulse
 PROBES  := ./internal/probes/...
 
 # Build flags
 LDFLAGS := -s -w -X main.version=$(shell git describe --tags --always 2>/dev/null || echo "dev")
 
-.PHONY: all generate build test clean
+.PHONY: all generate build build-agent build-consumer build-api test clean docker-up docker-down dev-web
 
 all: generate build
 
 # Generate BPF Go bindings for all probes.
-# Each probe package has its own //go:generate directive.
-# Adding a new probe = create the package, no Makefile edits needed.
 generate:
 	@echo "==> Generating BPF Go bindings..."
 	go generate $(PROBES)
 	@echo "==> Done"
 
-# Build the kubepulse binary
-build:
-	@echo "==> Building kubepulse..."
-	go build -v -ldflags "$(LDFLAGS)" -o $(BINARY) $(CMD)
-	@echo "==> Built $(BINARY)"
+# Build all Go binaries
+build: build-agent build-consumer build-api
+
+build-agent:
+	@echo "==> Building kubepulse agent..."
+	go build -v -ldflags "$(LDFLAGS)" -o bin/kubepulse ./cmd/kubepulse
+	@echo "==> Built bin/kubepulse"
+
+build-consumer:
+	@echo "==> Building consumer..."
+	go build -v -ldflags "$(LDFLAGS)" -o bin/consumer ./cmd/consumer
+	@echo "==> Built bin/consumer"
+
+build-api:
+	@echo "==> Building API server..."
+	go build -v -ldflags "$(LDFLAGS)" -o bin/api ./cmd/api
+	@echo "==> Built bin/api"
 
 # Run Go unit tests
 test:
 	go test -v -race ./internal/...
 
-# Clean build artifacts and generated files
+# Infrastructure
+docker-up:
+	docker compose up -d
+
+docker-down:
+	docker compose down
+
+# Frontend dev server
+dev-web:
+	cd web && npm run dev
+
+# Clean
 clean:
-	rm -f $(BINARY)
+	rm -f bin/kubepulse bin/consumer bin/api
 	find internal/probes -name 'bpf_*.go' -delete
 	find internal/probes -name 'bpf_*.o' -delete

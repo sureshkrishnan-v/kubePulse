@@ -13,6 +13,8 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"go.uber.org/zap"
 
+	"github.com/sureshkrishnan-v/kubePulse/internal/bpfutil"
+	"github.com/sureshkrishnan-v/kubePulse/internal/constants"
 	"github.com/sureshkrishnan-v/kubePulse/internal/event"
 	"github.com/sureshkrishnan-v/kubePulse/internal/probe"
 )
@@ -25,11 +27,12 @@ type rawEvent struct {
 	SPort     uint16
 	DPort     uint16
 	State     uint32
-	_         uint32
+	Pad1      uint32
 	Timestamp uint64
-	Comm      [16]byte
+	Comm      [constants.CommSize]byte
 }
 
+// Module implements probe.Module for TCP retransmission detection.
 type Module struct {
 	deps   probe.Dependencies
 	logger *zap.Logger
@@ -38,7 +41,12 @@ type Module struct {
 	reader *ringbuf.Reader
 }
 
-func (m *Module) Name() string { return "retransmit" }
+// New creates a new Retransmit module instance (Factory constructor).
+func New() *Module {
+	return &Module{}
+}
+
+func (m *Module) Name() string { return constants.ModuleRetransmit }
 
 func (m *Module) Init(_ context.Context, deps probe.Dependencies) error {
 	m.deps = deps
@@ -86,7 +94,7 @@ func (m *Module) Start(ctx context.Context) error {
 		e.Timestamp = time.Now()
 		e.PID = raw.PID
 		e.UID = raw.UID
-		e.Comm = commString(raw.Comm)
+		e.Comm = bpfutil.CommString(raw.Comm)
 		e.Node = m.deps.NodeName
 		if m.deps.Metadata != nil {
 			if meta, found := m.deps.Metadata.Lookup(raw.PID); found {
@@ -107,12 +115,4 @@ func (m *Module) Stop(_ context.Context) error {
 	}
 	m.objs.Close()
 	return nil
-}
-
-func commString(comm [16]byte) string {
-	n := bytes.IndexByte(comm[:], 0)
-	if n < 0 {
-		n = len(comm)
-	}
-	return string(comm[:n])
 }

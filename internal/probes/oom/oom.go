@@ -13,6 +13,8 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"go.uber.org/zap"
 
+	"github.com/sureshkrishnan-v/kubePulse/internal/bpfutil"
+	"github.com/sureshkrishnan-v/kubePulse/internal/constants"
 	"github.com/sureshkrishnan-v/kubePulse/internal/event"
 	"github.com/sureshkrishnan-v/kubePulse/internal/probe"
 )
@@ -26,12 +28,13 @@ type rawEvent struct {
 	ShmemRSS    uint64
 	Pgtables    uint64
 	OOMScoreAdj int16
-	_           uint16
-	_pad2       uint32
+	Pad1        uint16
+	Pad2        uint32
 	Timestamp   uint64
-	Comm        [16]byte
+	Comm        [constants.CommSize]byte
 }
 
+// Module implements probe.Module for OOM kill detection.
 type Module struct {
 	deps   probe.Dependencies
 	logger *zap.Logger
@@ -40,7 +43,12 @@ type Module struct {
 	reader *ringbuf.Reader
 }
 
-func (m *Module) Name() string { return "oom" }
+// New creates a new OOM module instance (Factory constructor).
+func New() *Module {
+	return &Module{}
+}
+
+func (m *Module) Name() string { return constants.ModuleOOM }
 
 func (m *Module) Init(_ context.Context, deps probe.Dependencies) error {
 	m.deps = deps
@@ -88,7 +96,7 @@ func (m *Module) Start(ctx context.Context) error {
 		e.Timestamp = time.Now()
 		e.PID = raw.PID
 		e.UID = raw.UID
-		e.Comm = commString(raw.Comm)
+		e.Comm = bpfutil.CommString(raw.Comm)
 		e.Node = m.deps.NodeName
 		if m.deps.Metadata != nil {
 			if meta, found := m.deps.Metadata.Lookup(raw.PID); found {
@@ -96,8 +104,8 @@ func (m *Module) Start(ctx context.Context) error {
 				e.Pod = meta.PodName
 			}
 		}
-		e.SetNumeric("total_vm_kb", float64(raw.TotalVM*4))
-		e.SetNumeric("oom_score_adj", float64(raw.OOMScoreAdj))
+		e.SetNumeric(constants.KeyTotalVMKB, float64(raw.TotalVM*4))
+		e.SetNumeric(constants.KeyOOMScoreAdj, float64(raw.OOMScoreAdj))
 		m.deps.EventBus.Publish(e)
 	}
 }
@@ -111,12 +119,4 @@ func (m *Module) Stop(_ context.Context) error {
 	}
 	m.objs.Close()
 	return nil
-}
-
-func commString(comm [16]byte) string {
-	n := bytes.IndexByte(comm[:], 0)
-	if n < 0 {
-		n = len(comm)
-	}
-	return string(comm[:n])
 }

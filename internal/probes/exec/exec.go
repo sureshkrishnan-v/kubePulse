@@ -13,6 +13,8 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"go.uber.org/zap"
 
+	"github.com/sureshkrishnan-v/kubePulse/internal/bpfutil"
+	"github.com/sureshkrishnan-v/kubePulse/internal/constants"
 	"github.com/sureshkrishnan-v/kubePulse/internal/event"
 	"github.com/sureshkrishnan-v/kubePulse/internal/probe"
 )
@@ -21,12 +23,13 @@ type rawEvent struct {
 	PID       uint32
 	UID       uint32
 	OldPID    uint32
-	_         uint32
+	Pad1      uint32
 	Timestamp uint64
-	Comm      [16]byte
-	Filename  [128]byte
+	Comm      [constants.CommSize]byte
+	Filename  [constants.FilenameSize]byte
 }
 
+// Module implements probe.Module for process execution monitoring.
 type Module struct {
 	deps   probe.Dependencies
 	logger *zap.Logger
@@ -35,7 +38,12 @@ type Module struct {
 	reader *ringbuf.Reader
 }
 
-func (m *Module) Name() string { return "exec" }
+// New creates a new Exec module instance (Factory constructor).
+func New() *Module {
+	return &Module{}
+}
+
+func (m *Module) Name() string { return constants.ModuleExec }
 
 func (m *Module) Init(_ context.Context, deps probe.Dependencies) error {
 	m.deps = deps
@@ -83,7 +91,7 @@ func (m *Module) Start(ctx context.Context) error {
 		e.Timestamp = time.Now()
 		e.PID = raw.PID
 		e.UID = raw.UID
-		e.Comm = commString(raw.Comm)
+		e.Comm = bpfutil.CommString(raw.Comm)
 		e.Node = m.deps.NodeName
 		if m.deps.Metadata != nil {
 			if meta, found := m.deps.Metadata.Lookup(raw.PID); found {
@@ -91,7 +99,7 @@ func (m *Module) Start(ctx context.Context) error {
 				e.Pod = meta.PodName
 			}
 		}
-		e.SetLabel("filename", filenameString(raw.Filename))
+		e.SetLabel(constants.KeyFilename, bpfutil.FilenameString(raw.Filename))
 		m.deps.EventBus.Publish(e)
 	}
 }
@@ -105,20 +113,4 @@ func (m *Module) Stop(_ context.Context) error {
 	}
 	m.objs.Close()
 	return nil
-}
-
-func commString(comm [16]byte) string {
-	n := bytes.IndexByte(comm[:], 0)
-	if n < 0 {
-		n = len(comm)
-	}
-	return string(comm[:n])
-}
-
-func filenameString(f [128]byte) string {
-	n := bytes.IndexByte(f[:], 0)
-	if n < 0 {
-		n = len(f)
-	}
-	return string(f[:n])
 }

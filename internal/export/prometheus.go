@@ -12,11 +12,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
+	"github.com/sureshkrishnan-v/kubePulse/internal/constants"
 	"github.com/sureshkrishnan-v/kubePulse/internal/event"
 )
 
-// Prometheus is an exporter that consumes events from the EventBus
-// and updates Prometheus metrics.
+// Prometheus is an Exporter that consumes events from the EventBus
+// and updates Prometheus metrics. Implements the Exporter interface.
 type Prometheus struct {
 	addr   string
 	logger *zap.Logger
@@ -25,135 +26,128 @@ type Prometheus struct {
 	server *http.Server
 	ready  atomic.Bool
 
-	// Metrics — organized by category
-	tcpLatency    *prometheus.HistogramVec
-	dnsQueries    *prometheus.CounterVec
-	dnsLatency    *prometheus.HistogramVec
-	retransmits   *prometheus.CounterVec
-	tcpResets     *prometheus.CounterVec
-	packetDrops   *prometheus.CounterVec
+	// Network metrics
+	tcpLatency  *prometheus.HistogramVec
+	dnsQueries  *prometheus.CounterVec
+	dnsLatency  *prometheus.HistogramVec
+	retransmits *prometheus.CounterVec
+	tcpResets   *prometheus.CounterVec
+	packetDrops *prometheus.CounterVec
+
+	// System metrics
 	oomKills      *prometheus.CounterVec
 	processExecs  *prometheus.CounterVec
 	fileIOLatency *prometheus.HistogramVec
 	fileIOOps     *prometheus.CounterVec
 
-	// Self-observability
+	// Self-observability metrics
 	eventsProcessed *prometheus.CounterVec
 	eventsDropped   *prometheus.CounterVec
 	busQueueDepth   *prometheus.GaugeVec
 	moduleErrors    *prometheus.CounterVec
 }
 
-// NewPrometheus creates a Prometheus exporter.
+// NewPrometheus creates a Prometheus exporter that subscribes to the EventBus.
+// All metric names, buckets, and labels are sourced from the constants package.
 func NewPrometheus(addr string, bus *event.Bus, logger *zap.Logger) *Prometheus {
-	networkBuckets := []float64{
-		0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005,
-		0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
-	}
-	ioBuckets := []float64{
-		0.001, 0.005, 0.01, 0.025, 0.05, 0.1,
-		0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
-	}
-
 	p := &Prometheus{
 		addr:   addr,
 		logger: logger,
 		bus:    bus,
 
-		// --- Network ---
+		// --- Network Metrics ---
 		tcpLatency: promauto.NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "kubepulse_tcp_latency_seconds",
+			Name:    constants.MetricTCPLatency,
 			Help:    "TCP connection latency.",
-			Buckets: networkBuckets,
-		}, []string{"namespace", "pod", "node"}),
+			Buckets: constants.NetworkLatencyBuckets,
+		}, constants.LabelsNamespacePodNode),
 
 		dnsQueries: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "kubepulse_dns_queries_total",
+			Name: constants.MetricDNSQueries,
 			Help: "Total DNS queries observed.",
-		}, []string{"namespace", "pod", "domain", "node"}),
+		}, constants.LabelsNamespacePodDomainNode),
 
 		dnsLatency: promauto.NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "kubepulse_dns_latency_seconds",
+			Name:    constants.MetricDNSLatency,
 			Help:    "DNS query latency.",
-			Buckets: networkBuckets,
-		}, []string{"namespace", "pod", "node"}),
+			Buckets: constants.NetworkLatencyBuckets,
+		}, constants.LabelsNamespacePodNode),
 
 		retransmits: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "kubepulse_tcp_retransmits_total",
+			Name: constants.MetricTCPRetransmits,
 			Help: "Total TCP retransmissions.",
-		}, []string{"namespace", "pod", "node"}),
+		}, constants.LabelsNamespacePodNode),
 
 		tcpResets: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "kubepulse_tcp_resets_total",
+			Name: constants.MetricTCPResets,
 			Help: "Total TCP connection resets.",
-		}, []string{"namespace", "pod", "node"}),
+		}, constants.LabelsNamespacePodNode),
 
 		packetDrops: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "kubepulse_packet_drops_total",
+			Name: constants.MetricPacketDrops,
 			Help: "Total packets dropped by kernel.",
-		}, []string{"reason", "node"}),
+		}, constants.LabelsReasonNode),
 
-		// --- System ---
+		// --- System Metrics ---
 		oomKills: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "kubepulse_oom_kills_total",
+			Name: constants.MetricOOMKills,
 			Help: "Total OOM kill events.",
-		}, []string{"namespace", "pod", "node"}),
+		}, constants.LabelsNamespacePodNode),
 
 		processExecs: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "kubepulse_process_execs_total",
+			Name: constants.MetricProcessExecs,
 			Help: "Total process executions.",
-		}, []string{"namespace", "pod", "node"}),
+		}, constants.LabelsNamespacePodNode),
 
 		fileIOLatency: promauto.NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "kubepulse_fileio_latency_seconds",
+			Name:    constants.MetricFileIOLatency,
 			Help:    "File I/O latency.",
-			Buckets: ioBuckets,
-		}, []string{"namespace", "pod", "op", "node"}),
+			Buckets: constants.IOLatencyBuckets,
+		}, constants.LabelsNamespacePodOpNode),
 
 		fileIOOps: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "kubepulse_fileio_ops_total",
+			Name: constants.MetricFileIOOps,
 			Help: "Total slow file I/O operations.",
-		}, []string{"namespace", "pod", "op", "node"}),
+		}, constants.LabelsNamespacePodOpNode),
 
 		// --- Self-Observability ---
 		eventsProcessed: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "kubepulse_events_processed_total",
+			Name: constants.MetricEventsProcessed,
 			Help: "Total events processed by exporter.",
-		}, []string{"module"}),
+		}, constants.LabelsModule),
 
 		eventsDropped: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "kubepulse_events_dropped_total",
+			Name: constants.MetricEventsDropped,
 			Help: "Total events dropped due to backpressure.",
-		}, []string{"subscriber"}),
+		}, constants.LabelsSubscriber),
 
 		busQueueDepth: promauto.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "kubepulse_eventbus_queue_depth",
+			Name: constants.MetricBusQueueDepth,
 			Help: "Current event bus queue depth per subscriber.",
-		}, []string{"subscriber"}),
+		}, constants.LabelsSubscriber),
 
 		moduleErrors: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "kubepulse_module_errors_total",
+			Name: constants.MetricModuleErrors,
 			Help: "Total errors by module.",
-		}, []string{"module"}),
+		}, constants.LabelsModule),
 	}
 
 	// Subscribe to event bus
-	p.events = bus.Subscribe("prometheus")
+	p.events = bus.Subscribe(constants.ExporterPrometheus)
 
 	return p
 }
 
-func (p *Prometheus) Name() string { return "prometheus" }
+func (p *Prometheus) Name() string { return constants.ExporterPrometheus }
 
 func (p *Prometheus) Start(ctx context.Context) error {
-	// Start HTTP server
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle(constants.PathMetrics, promhttp.Handler())
+	mux.HandleFunc(constants.PathHealthz, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok\n"))
 	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(constants.PathReadyz, func(w http.ResponseWriter, r *http.Request) {
 		if p.ready.Load() {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("ready\n"))
@@ -166,22 +160,20 @@ func (p *Prometheus) Start(ctx context.Context) error {
 	p.server = &http.Server{
 		Addr:         p.addr,
 		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		ReadTimeout:  constants.HTTPReadTimeout,
+		WriteTimeout: constants.HTTPWriteTimeout,
+		IdleTimeout:  constants.HTTPIdleTimeout,
 	}
 
-	// Start HTTP server in background
 	go func() {
 		p.logger.Info("Prometheus exporter listening",
 			zap.String("addr", p.addr),
-			zap.String("path", "/metrics"))
+			zap.String("path", constants.PathMetrics))
 		if err := p.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			p.logger.Error("Prometheus HTTP server error", zap.Error(err))
 		}
 	}()
 
-	// Start self-observability stats collector
 	go p.collectBusStats(ctx)
 
 	p.ready.Store(true)
@@ -193,7 +185,7 @@ func (p *Prometheus) Start(ctx context.Context) error {
 			return ctx.Err()
 		case evt, ok := <-p.events:
 			if !ok {
-				return nil // bus closed
+				return nil
 			}
 			p.processEvent(evt)
 		}
@@ -214,18 +206,18 @@ func (p *Prometheus) SetReady() {
 }
 
 // processEvent dispatches an event to the correct Prometheus metric.
+// Uses constants for event label/numeric keys — Strategy pattern for dispatch.
 func (p *Prometheus) processEvent(e *event.Event) {
 	p.eventsProcessed.WithLabelValues(e.Type.String()).Inc()
 
 	switch e.Type {
 	case event.TypeTCP:
-		latency := e.NumericVal("latency_sec")
-		p.tcpLatency.WithLabelValues(e.Namespace, e.Pod, e.Node).Observe(latency)
+		p.tcpLatency.WithLabelValues(e.Namespace, e.Pod, e.Node).
+			Observe(e.NumericVal(constants.KeyLatencySec))
 
 	case event.TypeDNS:
-		domain := e.Label("domain")
-		p.dnsQueries.WithLabelValues(e.Namespace, e.Pod, domain, e.Node).Inc()
-		if latency := e.NumericVal("latency_sec"); latency > 0 {
+		p.dnsQueries.WithLabelValues(e.Namespace, e.Pod, e.Label(constants.KeyDomain), e.Node).Inc()
+		if latency := e.NumericVal(constants.KeyLatencySec); latency > 0 {
 			p.dnsLatency.WithLabelValues(e.Namespace, e.Pod, e.Node).Observe(latency)
 		}
 
@@ -242,20 +234,19 @@ func (p *Prometheus) processEvent(e *event.Event) {
 		p.processExecs.WithLabelValues(e.Namespace, e.Pod, e.Node).Inc()
 
 	case event.TypeFileIO:
-		op := e.Label("op")
-		latency := e.NumericVal("latency_sec")
-		p.fileIOLatency.WithLabelValues(e.Namespace, e.Pod, op, e.Node).Observe(latency)
+		op := e.Label(constants.KeyOp)
+		p.fileIOLatency.WithLabelValues(e.Namespace, e.Pod, op, e.Node).
+			Observe(e.NumericVal(constants.KeyLatencySec))
 		p.fileIOOps.WithLabelValues(e.Namespace, e.Pod, op, e.Node).Inc()
 
 	case event.TypeDrop:
-		reason := e.Label("reason")
-		p.packetDrops.WithLabelValues(reason, e.Node).Inc()
+		p.packetDrops.WithLabelValues(e.Label(constants.KeyReason), e.Node).Inc()
 	}
 }
 
 // collectBusStats periodically updates event bus self-observability metrics.
 func (p *Prometheus) collectBusStats(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(constants.StatsCollectInterval)
 	defer ticker.Stop()
 
 	for {

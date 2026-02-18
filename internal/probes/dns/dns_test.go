@@ -1,36 +1,34 @@
 package dns
 
-import "testing"
+import (
+	"testing"
 
-func TestEvent_QNameString(t *testing.T) {
-	event := Event{}
-	copy(event.QName[:], "google.com")
-	if got := event.QNameString(); got != "google.com" {
-		t.Errorf("QNameString() = %q, want %q", got, "google.com")
+	"github.com/sureshkrishnan-v/kubePulse/internal/constants"
+)
+
+func TestNew(t *testing.T) {
+	m := New()
+	if m == nil {
+		t.Fatal("New() returned nil")
 	}
-}
-
-func TestEvent_QNameString_Empty(t *testing.T) {
-	event := Event{}
-	if got := event.QNameString(); got != "" {
-		t.Errorf("QNameString() = %q, want empty", got)
+	if m.Name() != constants.ModuleDNS {
+		t.Errorf("Name() = %q, want %q", m.Name(), constants.ModuleDNS)
 	}
 }
 
 func TestTruncateDomain(t *testing.T) {
 	tests := []struct {
-		input, want string
+		domain string
+		want   string
 	}{
-		{"www.google.com", "google.com"},
-		{"a.b.c.d.example.org", "example.org"},
+		{"api.svc.cluster.local", "cluster.local"},
 		{"example.com", "example.com"},
-		{"localhost", "localhost"},
+		{"a.b.c.example.com", "example.com"},
 	}
 	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			if got := TruncateDomain(tt.input); got != tt.want {
-				t.Errorf("TruncateDomain(%q) = %q, want %q", tt.input, got, tt.want)
-			}
-		})
+		got := TruncateDomain(tt.domain)
+		if got != tt.want {
+			t.Errorf("TruncateDomain(%q) = %q, want %q", tt.domain, got, tt.want)
+		}
 	}
 }

@@ -1,5 +1,4 @@
 // Package tcp implements the TCP connection latency module.
-// It hooks tcp_connect and tcp_close kprobes to measure connection setup time.
 package tcp
 
 import (
@@ -14,6 +13,8 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"go.uber.org/zap"
 
+	"github.com/sureshkrishnan-v/kubePulse/internal/bpfutil"
+	"github.com/sureshkrishnan-v/kubePulse/internal/constants"
 	"github.com/sureshkrishnan-v/kubePulse/internal/event"
 	"github.com/sureshkrishnan-v/kubePulse/internal/probe"
 )
@@ -28,7 +29,7 @@ type rawEvent struct {
 	DPort     uint16
 	LatencyNs uint64
 	Timestamp uint64
-	Comm      [16]byte
+	Comm      [constants.CommSize]byte
 }
 
 // Module implements probe.Module for TCP connection latency monitoring.
@@ -41,7 +42,12 @@ type Module struct {
 	reader *ringbuf.Reader
 }
 
-func (m *Module) Name() string { return "tcp" }
+// New creates a new TCP module instance (Factory constructor).
+func New() *Module {
+	return &Module{}
+}
+
+func (m *Module) Name() string { return constants.ModuleTCP }
 
 func (m *Module) Init(_ context.Context, deps probe.Dependencies) error {
 	m.deps = deps
@@ -98,16 +104,14 @@ func (m *Module) Start(ctx context.Context) error {
 			continue
 		}
 
-		// Enrich and publish to EventBus
 		e := event.Acquire()
 		e.Type = event.TypeTCP
 		e.Timestamp = time.Now()
 		e.PID = raw.PID
 		e.UID = raw.UID
-		e.Comm = commString(raw.Comm)
+		e.Comm = bpfutil.CommString(raw.Comm)
 		e.Node = m.deps.NodeName
 
-		// Resolve K8s metadata
 		if m.deps.Metadata != nil {
 			if meta, found := m.deps.Metadata.Lookup(raw.PID); found {
 				e.Namespace = meta.Namespace
@@ -115,11 +119,10 @@ func (m *Module) Start(ctx context.Context) error {
 			}
 		}
 
-		// Type-specific fields
-		e.SetLabel("src", fmt.Sprintf("%s:%d", FormatIPv4(raw.SAddr), raw.SPort))
-		e.SetLabel("dst", fmt.Sprintf("%s:%d", FormatIPv4(raw.DAddr), raw.DPort))
-		e.SetNumeric("latency_sec", float64(raw.LatencyNs)/1e9)
-		e.SetNumeric("latency_ns", float64(raw.LatencyNs))
+		e.SetLabel(constants.KeySrc, fmt.Sprintf("%s:%d", bpfutil.FormatIPv4(raw.SAddr), raw.SPort))
+		e.SetLabel(constants.KeyDst, fmt.Sprintf("%s:%d", bpfutil.FormatIPv4(raw.DAddr), raw.DPort))
+		e.SetNumeric(constants.KeyLatencySec, float64(raw.LatencyNs)/constants.NsPerSecond)
+		e.SetNumeric(constants.KeyLatencyNs, float64(raw.LatencyNs))
 
 		m.deps.EventBus.Publish(e)
 	}
@@ -134,18 +137,4 @@ func (m *Module) Stop(_ context.Context) error {
 	}
 	m.objs.Close()
 	return nil
-}
-
-// FormatIPv4 converts a uint32 IPv4 address to dotted-decimal string.
-func FormatIPv4(ip uint32) string {
-	return fmt.Sprintf("%d.%d.%d.%d",
-		byte(ip), byte(ip>>8), byte(ip>>16), byte(ip>>24))
-}
-
-func commString(comm [16]byte) string {
-	n := bytes.IndexByte(comm[:], 0)
-	if n < 0 {
-		n = len(comm)
-	}
-	return string(comm[:n])
 }

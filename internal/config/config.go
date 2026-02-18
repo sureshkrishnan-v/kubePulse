@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/sureshkrishnan-v/kubePulse/internal/constants"
 )
 
 // Config is the top-level configuration for KubePulse.
@@ -30,6 +32,15 @@ type ModuleConfig struct {
 	Enabled        bool    `yaml:"enabled"`
 	RingBufferSize int     `yaml:"ring_buffer_size"`
 	SamplingRate   float64 `yaml:"sampling_rate"`
+}
+
+// NewModuleConfig creates a ModuleConfig with production defaults.
+func NewModuleConfig(ringBufSize int) *ModuleConfig {
+	return &ModuleConfig{
+		Enabled:        true,
+		RingBufferSize: ringBufSize,
+		SamplingRate:   constants.DefaultSamplingRate,
+	}
 }
 
 // ExportersConfig holds exporter settings.
@@ -57,48 +68,49 @@ type PerformanceConfig struct {
 }
 
 // Default returns a Config with sensible production defaults.
+// All magic numbers are sourced from the constants package.
 func Default() *Config {
-	modules := map[string]*ModuleConfig{
-		"tcp":        {Enabled: true, RingBufferSize: 262144, SamplingRate: 1.0},
-		"dns":        {Enabled: true, RingBufferSize: 262144, SamplingRate: 1.0},
-		"retransmit": {Enabled: true, RingBufferSize: 131072, SamplingRate: 1.0},
-		"rst":        {Enabled: true, RingBufferSize: 131072, SamplingRate: 1.0},
-		"oom":        {Enabled: true, RingBufferSize: 65536, SamplingRate: 1.0},
-		"exec":       {Enabled: true, RingBufferSize: 131072, SamplingRate: 1.0},
-		"fileio":     {Enabled: true, RingBufferSize: 262144, SamplingRate: 1.0},
-		"drop":       {Enabled: true, RingBufferSize: 131072, SamplingRate: 1.0},
-	}
-
 	hostname, _ := os.Hostname()
 
 	return &Config{
 		Agent: AgentConfig{
-			MetricsAddr: ":9090",
+			MetricsAddr: constants.DefaultMetricsAddr,
 			NodeName:    hostname,
-			LogLevel:    "info",
+			LogLevel:    constants.DefaultLogLevel,
 		},
-		Modules: modules,
+		Modules: map[string]*ModuleConfig{
+			constants.ModuleTCP:        NewModuleConfig(constants.RingBufLarge),
+			constants.ModuleDNS:        NewModuleConfig(constants.RingBufLarge),
+			constants.ModuleRetransmit: NewModuleConfig(constants.RingBufMedium),
+			constants.ModuleRST:        NewModuleConfig(constants.RingBufMedium),
+			constants.ModuleOOM:        NewModuleConfig(constants.RingBufSmall),
+			constants.ModuleExec:       NewModuleConfig(constants.RingBufMedium),
+			constants.ModuleFileIO:     NewModuleConfig(constants.RingBufLarge),
+			constants.ModuleDrop:       NewModuleConfig(constants.RingBufMedium),
+		},
 		Exporters: ExportersConfig{
-			Prometheus: PrometheusConfig{Enabled: true, Addr: ":9090"},
-			OTLP:       OTLPConfig{Enabled: false},
+			Prometheus: PrometheusConfig{
+				Enabled: true,
+				Addr:    constants.DefaultMetricsAddr,
+			},
+			OTLP: OTLPConfig{Enabled: false},
 		},
 		Performance: PerformanceConfig{
-			EventBusBuffer: 4096,
-			WorkerPoolSize: 4,
+			EventBusBuffer: constants.DefaultEventBusBuffer,
+			WorkerPoolSize: constants.DefaultWorkerPoolSize,
 		},
 	}
 }
 
 // Load reads a YAML config file and merges with defaults.
 // If the file doesn't exist, returns defaults.
-// Environment variables override: KUBEPULSE_METRICS_ADDR, KUBEPULSE_NODE_NAME.
+// Environment variables override file settings.
 func Load(path string) (*Config, error) {
 	cfg := Default()
 
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// No config file — use defaults + env overrides
 			cfg.applyEnvOverrides()
 			return cfg, nil
 		}
@@ -120,14 +132,14 @@ func Load(path string) (*Config, error) {
 
 // applyEnvOverrides allows environment variables to override config values.
 func (c *Config) applyEnvOverrides() {
-	if addr := os.Getenv("KUBEPULSE_METRICS_ADDR"); addr != "" {
+	if addr := os.Getenv(constants.EnvMetricsAddr); addr != "" {
 		c.Agent.MetricsAddr = addr
 		c.Exporters.Prometheus.Addr = addr
 	}
-	if node := os.Getenv("KUBEPULSE_NODE_NAME"); node != "" {
+	if node := os.Getenv(constants.EnvNodeName); node != "" {
 		c.Agent.NodeName = node
 	}
-	if level := os.Getenv("KUBEPULSE_LOG_LEVEL"); level != "" {
+	if level := os.Getenv(constants.EnvLogLevel); level != "" {
 		c.Agent.LogLevel = level
 	}
 }
@@ -139,15 +151,19 @@ func (c *Config) Validate() error {
 	if c.Agent.MetricsAddr == "" {
 		errs = append(errs, "agent.metrics_addr is required")
 	}
-	if c.Performance.EventBusBuffer < 64 {
-		errs = append(errs, "performance.event_bus_buffer must be >= 64")
+	if c.Performance.EventBusBuffer < constants.MinEventBusBuffer {
+		errs = append(errs, fmt.Sprintf(
+			"performance.event_bus_buffer must be >= %d", constants.MinEventBusBuffer))
 	}
-	if c.Performance.WorkerPoolSize < 1 {
-		errs = append(errs, "performance.worker_pool_size must be >= 1")
+	if c.Performance.WorkerPoolSize < constants.MinWorkerPoolSize {
+		errs = append(errs, fmt.Sprintf(
+			"performance.worker_pool_size must be >= %d", constants.MinWorkerPoolSize))
 	}
 	for name, mod := range c.Modules {
-		if mod.SamplingRate < 0 || mod.SamplingRate > 1 {
-			errs = append(errs, fmt.Sprintf("modules.%s.sampling_rate must be in [0, 1]", name))
+		if mod.SamplingRate < constants.MinSamplingRate || mod.SamplingRate > constants.MaxSamplingRate {
+			errs = append(errs, fmt.Sprintf(
+				"modules.%s.sampling_rate must be in [%.1f, %.1f]",
+				name, constants.MinSamplingRate, constants.MaxSamplingRate))
 		}
 	}
 
@@ -157,20 +173,21 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// ModuleEnabled returns true if the named module is enabled (or not configured, defaults to true).
+// ModuleEnabled returns whether the named module is enabled.
+// Defaults to true if not configured.
 func (c *Config) ModuleEnabled(name string) bool {
 	mod, ok := c.Modules[name]
 	if !ok {
-		return true // default: enabled
+		return true
 	}
 	return mod.Enabled
 }
 
-// ModuleConf returns the config for a specific module, or a default if not found.
+// ModuleConf returns the config for a module, or default if not found.
 func (c *Config) ModuleConf(name string) *ModuleConfig {
 	mod, ok := c.Modules[name]
 	if !ok {
-		return &ModuleConfig{Enabled: true, RingBufferSize: 262144, SamplingRate: 1.0}
+		return NewModuleConfig(constants.DefaultRingBufferSize)
 	}
 	return mod
 }

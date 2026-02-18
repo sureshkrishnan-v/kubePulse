@@ -5,6 +5,8 @@ import (
 	"sync/atomic"
 
 	"go.uber.org/zap"
+
+	"github.com/sureshkrishnan-v/kubePulse/internal/constants"
 )
 
 // Bus is a high-performance event distribution system.
@@ -29,10 +31,14 @@ type Bus struct {
 }
 
 // NewBus creates a new event bus with the specified per-subscriber buffer size.
-// Recommended: 4096 for moderate load, 8192 for high-throughput environments.
+// If bufferSize <= 0, defaults to constants.DefaultEventBusBuffer.
+// If logger is nil, a no-op logger is used.
 func NewBus(bufferSize int, logger *zap.Logger) *Bus {
 	if bufferSize <= 0 {
-		bufferSize = 4096
+		bufferSize = constants.DefaultEventBusBuffer
+	}
+	if logger == nil {
+		logger = zap.NewNop()
 	}
 	return &Bus{
 		logger:      logger,
@@ -107,7 +113,7 @@ func (b *Bus) Close() {
 	}
 }
 
-// Stats returns current bus statistics.
+// Stats holds a snapshot of bus metrics.
 type Stats struct {
 	Published           uint64
 	DroppedBySubscriber map[string]uint64

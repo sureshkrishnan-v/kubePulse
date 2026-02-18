@@ -1,5 +1,4 @@
 // Package dns implements the DNS query monitoring module.
-// It hooks udp_sendmsg to capture DNS queries (port 53).
 package dns
 
 import (
@@ -15,6 +14,8 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"go.uber.org/zap"
 
+	"github.com/sureshkrishnan-v/kubePulse/internal/bpfutil"
+	"github.com/sureshkrishnan-v/kubePulse/internal/constants"
 	"github.com/sureshkrishnan-v/kubePulse/internal/event"
 	"github.com/sureshkrishnan-v/kubePulse/internal/probe"
 )
@@ -24,10 +25,10 @@ type rawEvent struct {
 	UID       uint32
 	DAddr     uint32
 	DPort     uint16
-	_         uint16
-	QName     [128]byte
+	Pad1      uint16
+	QName     [constants.QNameSize]byte
 	Timestamp uint64
-	Comm      [16]byte
+	Comm      [constants.CommSize]byte
 }
 
 // Module implements probe.Module for DNS query monitoring.
@@ -40,7 +41,12 @@ type Module struct {
 	reader *ringbuf.Reader
 }
 
-func (m *Module) Name() string { return "dns" }
+// New creates a new DNS module instance (Factory constructor).
+func New() *Module {
+	return &Module{}
+}
+
+func (m *Module) Name() string { return constants.ModuleDNS }
 
 func (m *Module) Init(_ context.Context, deps probe.Dependencies) error {
 	m.deps = deps
@@ -95,7 +101,7 @@ func (m *Module) Start(ctx context.Context) error {
 		e.Timestamp = time.Now()
 		e.PID = raw.PID
 		e.UID = raw.UID
-		e.Comm = commString(raw.Comm)
+		e.Comm = bpfutil.CommString(raw.Comm)
 		e.Node = m.deps.NodeName
 
 		if m.deps.Metadata != nil {
@@ -105,9 +111,9 @@ func (m *Module) Start(ctx context.Context) error {
 			}
 		}
 
-		qname := qnameString(raw.QName)
-		e.SetLabel("qname", qname)
-		e.SetLabel("domain", TruncateDomain(qname))
+		qname := bpfutil.QNameString(raw.QName)
+		e.SetLabel(constants.KeyQName, qname)
+		e.SetLabel(constants.KeyDomain, TruncateDomain(qname))
 
 		m.deps.EventBus.Publish(e)
 	}
@@ -124,28 +130,12 @@ func (m *Module) Stop(_ context.Context) error {
 	return nil
 }
 
-// TruncateDomain reduces a FQDN to its top-level registered domain for
-// low-cardinality Prometheus labels.
+// TruncateDomain reduces a FQDN to its top-level registered domain
+// for low-cardinality Prometheus labels.
 func TruncateDomain(domain string) string {
 	parts := strings.Split(domain, ".")
 	if len(parts) <= 2 {
 		return domain
 	}
 	return strings.Join(parts[len(parts)-2:], ".")
-}
-
-func commString(comm [16]byte) string {
-	n := bytes.IndexByte(comm[:], 0)
-	if n < 0 {
-		n = len(comm)
-	}
-	return string(comm[:n])
-}
-
-func qnameString(qname [128]byte) string {
-	n := bytes.IndexByte(qname[:], 0)
-	if n < 0 {
-		n = len(qname)
-	}
-	return string(qname[:n])
 }

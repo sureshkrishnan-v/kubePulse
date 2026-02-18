@@ -1,5 +1,4 @@
-// Package fileio implements the file I/O latency monitoring probe.
-// It hooks kprobe/kretprobe on vfs_read and vfs_write to measure I/O latency.
+// Package fileio implements the file I/O latency monitoring module.
 package fileio
 
 import (
@@ -8,145 +7,140 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"go.uber.org/zap"
+
+	"github.com/sureshkrishnan-v/kubePulse/internal/bpfutil"
+	"github.com/sureshkrishnan-v/kubePulse/internal/constants"
+	"github.com/sureshkrishnan-v/kubePulse/internal/event"
+	"github.com/sureshkrishnan-v/kubePulse/internal/probe"
 )
 
-// Operation type constants matching the BPF program.
-const (
-	OpRead  = 0
-	OpWrite = 1
-)
-
-// Event represents a file I/O operation captured by the BPF program.
-type Event struct {
+type rawEvent struct {
 	PID       uint32
 	UID       uint32
 	LatencyNs uint64
 	Bytes     uint64
 	Op        uint32 // 0=read, 1=write
-	_         uint32 // padding
+	Pad1      uint32
 	Timestamp uint64
-	Comm      [16]byte
+	Comm      [constants.CommSize]byte
 }
 
-// CommString returns the process name as a Go string.
-func (e *Event) CommString() string {
-	n := bytes.IndexByte(e.Comm[:], 0)
-	if n < 0 {
-		n = len(e.Comm)
-	}
-	return string(e.Comm[:n])
-}
-
-// OpString returns "read" or "write" based on the operation type.
-func (e *Event) OpString() string {
-	if e.Op == OpWrite {
-		return "write"
-	}
-	return "read"
-}
-
-// Handler is the callback signature for file I/O events.
-type Handler func(Event)
-
-// Probe implements probe.Probe for file I/O latency monitoring.
-type Probe struct {
-	logger  *zap.Logger
-	handler Handler
-
+// Module implements probe.Module for file I/O latency monitoring.
+type Module struct {
+	deps   probe.Dependencies
+	logger *zap.Logger
 	objs   bpfObjects
 	links  []link.Link
 	reader *ringbuf.Reader
 }
 
-// New creates a new file I/O probe.
-func New(logger *zap.Logger, handler Handler) *Probe {
-	return &Probe{logger: logger, handler: handler}
+// New creates a new FileIO module instance (Factory constructor).
+func New() *Module {
+	return &Module{}
 }
 
-func (p *Probe) Name() string { return "fileio" }
+func (m *Module) Name() string { return constants.ModuleFileIO }
 
-func (p *Probe) Init() error {
-	if err := loadBpfObjects(&p.objs, nil); err != nil {
+func (m *Module) Init(_ context.Context, deps probe.Dependencies) error {
+	m.deps = deps
+	m.logger = deps.Logger
+	if err := loadBpfObjects(&m.objs, nil); err != nil {
 		return fmt.Errorf("loading BPF objects: %w", err)
 	}
 
-	// vfs_read kprobe + kretprobe
-	kpRead, err := link.Kprobe("vfs_read", p.objs.KprobeVfsRead, nil)
+	kpRead, err := link.Kprobe("vfs_read", m.objs.KprobeVfsRead, nil)
 	if err != nil {
-		p.Close()
+		m.Stop(context.Background())
 		return fmt.Errorf("attaching vfs_read kprobe: %w", err)
 	}
-	p.links = append(p.links, kpRead)
+	m.links = append(m.links, kpRead)
 
-	krpRead, err := link.Kretprobe("vfs_read", p.objs.KretprobeVfsRead, nil)
+	krpRead, err := link.Kretprobe("vfs_read", m.objs.KretprobeVfsRead, nil)
 	if err != nil {
-		p.Close()
+		m.Stop(context.Background())
 		return fmt.Errorf("attaching vfs_read kretprobe: %w", err)
 	}
-	p.links = append(p.links, krpRead)
+	m.links = append(m.links, krpRead)
 
-	// vfs_write kprobe + kretprobe
-	kpWrite, err := link.Kprobe("vfs_write", p.objs.KprobeVfsWrite, nil)
+	kpWrite, err := link.Kprobe("vfs_write", m.objs.KprobeVfsWrite, nil)
 	if err != nil {
-		p.Close()
+		m.Stop(context.Background())
 		return fmt.Errorf("attaching vfs_write kprobe: %w", err)
 	}
-	p.links = append(p.links, kpWrite)
+	m.links = append(m.links, kpWrite)
 
-	krpWrite, err := link.Kretprobe("vfs_write", p.objs.KretprobeVfsWrite, nil)
+	krpWrite, err := link.Kretprobe("vfs_write", m.objs.KretprobeVfsWrite, nil)
 	if err != nil {
-		p.Close()
+		m.Stop(context.Background())
 		return fmt.Errorf("attaching vfs_write kretprobe: %w", err)
 	}
-	p.links = append(p.links, krpWrite)
+	m.links = append(m.links, krpWrite)
 
-	p.reader, err = ringbuf.NewReader(p.objs.FileioEvents)
+	m.reader, err = ringbuf.NewReader(m.objs.FileioEvents)
 	if err != nil {
-		p.Close()
+		m.Stop(context.Background())
 		return fmt.Errorf("creating ring buffer reader: %w", err)
 	}
-
 	return nil
 }
 
-func (p *Probe) Run(ctx context.Context) error {
-	p.logger.Info("FileIO probe consumer started")
+func (m *Module) Start(ctx context.Context) error {
+	m.logger.Info("FileIO module consumer started")
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-
-		record, err := p.reader.Read()
+		record, err := m.reader.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				return nil
 			}
-			p.logger.Warn("Reading fileio event", zap.Error(err))
+			m.logger.Warn("Reading fileio event", zap.Error(err))
 			continue
 		}
-
-		var event Event
-		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
-			p.logger.Warn("Parsing fileio event", zap.Error(err))
+		var raw rawEvent
+		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &raw); err != nil {
+			m.logger.Warn("Parsing fileio event", zap.Error(err))
 			continue
 		}
-		p.handler(event)
+		e := event.Acquire()
+		e.Type = event.TypeFileIO
+		e.Timestamp = time.Now()
+		e.PID = raw.PID
+		e.UID = raw.UID
+		e.Comm = bpfutil.CommString(raw.Comm)
+		e.Node = m.deps.NodeName
+		if m.deps.Metadata != nil {
+			if meta, found := m.deps.Metadata.Lookup(raw.PID); found {
+				e.Namespace = meta.Namespace
+				e.Pod = meta.PodName
+			}
+		}
+		op := constants.FileOpRead
+		if raw.Op == 1 {
+			op = constants.FileOpWrite
+		}
+		e.SetLabel(constants.KeyOp, op)
+		e.SetNumeric(constants.KeyLatencySec, float64(raw.LatencyNs)/constants.NsPerSecond)
+		e.SetNumeric(constants.KeyBytes, float64(raw.Bytes))
+		m.deps.EventBus.Publish(e)
 	}
 }
 
-func (p *Probe) Close() error {
-	if p.reader != nil {
-		p.reader.Close()
+func (m *Module) Stop(_ context.Context) error {
+	if m.reader != nil {
+		m.reader.Close()
 	}
-	for _, l := range p.links {
+	for _, l := range m.links {
 		l.Close()
 	}
-	p.objs.Close()
+	m.objs.Close()
 	return nil
 }

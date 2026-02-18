@@ -1,21 +1,29 @@
-// KubePulse — eBPF-powered Kubernetes-aware observability agent.
+// KubePulse — eBPF-powered, modular Kubernetes observability agent.
 //
-// Architecture: pluggable probe system. Each probe is a self-contained package
-// implementing probe.Probe. To add a new probe: create a package, register here.
+// Architecture: pluggable Module system with EventBus (Observer pattern).
+// Each module publishes events to the bus; exporters subscribe and consume.
+//
+// Design patterns used:
+//   - Factory: New() constructors for all modules and exporters
+//   - Registry: Runtime.RegisterModule / RegisterExporter
+//   - Observer: EventBus pub/sub decouples producers from consumers
+//   - Strategy: each Module encapsulates a specific BPF monitoring strategy
+//   - DI: Dependencies struct injected into modules at Init time
+//   - Facade: Runtime.Run() orchestrates all subsystems
 package main
 
 import (
 	"context"
-	"fmt"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
 	"github.com/sureshkrishnan-v/kubePulse/internal/agent"
-	kubemetrics "github.com/sureshkrishnan-v/kubePulse/internal/metrics"
+	"github.com/sureshkrishnan-v/kubePulse/internal/config"
+	"github.com/sureshkrishnan-v/kubePulse/internal/constants"
+	"github.com/sureshkrishnan-v/kubePulse/internal/export"
 	"github.com/sureshkrishnan-v/kubePulse/internal/probes/dns"
 	"github.com/sureshkrishnan-v/kubePulse/internal/probes/drop"
 	execprobe "github.com/sureshkrishnan-v/kubePulse/internal/probes/exec"
@@ -26,8 +34,6 @@ import (
 	"github.com/sureshkrishnan-v/kubePulse/internal/probes/tcp"
 )
 
-const version = "3.0.0"
-
 func main() {
 	// Logger
 	logCfg := zap.NewProductionConfig()
@@ -36,114 +42,45 @@ func main() {
 	logger, _ := logCfg.Build()
 	defer logger.Sync()
 
-	logger.Info("KubePulse starting", zap.String("version", version))
+	logger.Info("KubePulse starting", zap.String("version", constants.Version))
 
-	// Config
-	cfg := agent.LoadConfig()
+	// Config (YAML + env overrides)
+	cfg, err := config.Load(constants.DefaultConfigPath)
+	if err != nil {
+		logger.Fatal("Failed to load config", zap.Error(err))
+	}
 
-	// Metrics
-	m := kubemetrics.New()
+	// Runtime (Facade pattern)
+	rt := agent.NewRuntime(cfg, logger)
 
-	// Agent
-	a := agent.New(cfg, logger)
+	// ─── Register modules (Factory + Registry pattern) ─────────
+	// Each module uses New() constructor — no raw struct literals.
+	// To add a new module:
+	//   1. Create internal/probes/yourmodule/ package
+	//   2. Implement probe.Module interface
+	//   3. Add one line here: rt.RegisterModule(yourmodule.New())
+	rt.RegisterModule(tcp.New())
+	rt.RegisterModule(dns.New())
+	rt.RegisterModule(retransmit.New())
+	rt.RegisterModule(rst.New())
+	rt.RegisterModule(oom.New())
+	rt.RegisterModule(execprobe.New())
+	rt.RegisterModule(fileio.New())
+	rt.RegisterModule(drop.New())
 
-	// ─── Register probes ───────────────────────────────────────
-	// To add a new probe:
-	//   1. Create internal/probes/yourprobe/ package
-	//   2. Add one line here: a.Register(yourprobe.New(logger, handler))
-	//   That's it.
+	// ─── Register exporters (Observer pattern) ─────────────────
+	// Prometheus exporter subscribes to EventBus automatically.
+	// Future: add OTLP, Kafka, etc.
+	rt.RegisterExporter(export.NewPrometheus(
+		cfg.Exporters.Prometheus.Addr, rt.EventBus(), logger,
+	))
 
-	a.Register(tcp.New(logger, func(e tcp.Event) {
-		ns, pod := a.ResolvePod(e.PID)
-		m.ObserveTCPLatency(ns, pod, cfg.NodeName, float64(e.LatencyNs)/1e9)
-		logger.Info("tcp",
-			zap.Uint32("pid", e.PID), zap.String("comm", e.CommString()),
-			zap.String("src", fmt.Sprintf("%s:%d", tcp.FormatIPv4(e.SAddr), e.SPort)),
-			zap.String("dst", fmt.Sprintf("%s:%d", tcp.FormatIPv4(e.DAddr), e.DPort)),
-			zap.String("latency", fmtDuration(e.LatencyNs)),
-			zap.String("ns", ns), zap.String("pod", pod))
-	}))
-
-	a.Register(dns.New(logger, func(e dns.Event) {
-		ns, pod := a.ResolvePod(e.PID)
-		domain := dns.TruncateDomain(e.QNameString())
-		m.ObserveDNSQuery(ns, pod, domain, cfg.NodeName)
-		logger.Info("dns",
-			zap.Uint32("pid", e.PID), zap.String("comm", e.CommString()),
-			zap.String("query", e.QNameString()), zap.String("domain", domain),
-			zap.String("ns", ns), zap.String("pod", pod))
-	}))
-
-	a.Register(retransmit.New(logger, func(e retransmit.Event) {
-		ns, pod := a.ResolvePod(e.PID)
-		m.ObserveRetransmit(ns, pod, cfg.NodeName)
-		logger.Warn("tcp_retransmit",
-			zap.Uint32("pid", e.PID), zap.String("comm", e.CommString()),
-			zap.String("ns", ns), zap.String("pod", pod))
-	}))
-
-	a.Register(rst.New(logger, func(e rst.Event) {
-		ns, pod := a.ResolvePod(e.PID)
-		m.ObserveReset(ns, pod, cfg.NodeName)
-		logger.Warn("tcp_rst",
-			zap.Uint32("pid", e.PID), zap.String("comm", e.CommString()),
-			zap.String("ns", ns), zap.String("pod", pod))
-	}))
-
-	a.Register(oom.New(logger, func(e oom.Event) {
-		ns, pod := a.ResolvePod(e.PID)
-		m.ObserveOOMKill(ns, pod, cfg.NodeName)
-		logger.Error("oom_kill",
-			zap.Uint32("pid", e.PID), zap.String("comm", e.CommString()),
-			zap.Uint64("total_vm_kb", e.TotalVMKB()),
-			zap.Int16("oom_score_adj", e.OOMScoreAdj),
-			zap.String("ns", ns), zap.String("pod", pod))
-	}))
-
-	a.Register(execprobe.New(logger, func(e execprobe.Event) {
-		ns, pod := a.ResolvePod(e.PID)
-		m.ObserveExec(ns, pod, cfg.NodeName)
-		logger.Info("exec",
-			zap.Uint32("pid", e.PID), zap.String("comm", e.CommString()),
-			zap.String("filename", e.FilenameString()),
-			zap.String("ns", ns), zap.String("pod", pod))
-	}))
-
-	a.Register(fileio.New(logger, func(e fileio.Event) {
-		ns, pod := a.ResolvePod(e.PID)
-		m.ObserveFileIO(ns, pod, e.OpString(), cfg.NodeName, float64(e.LatencyNs)/1e9)
-		logger.Info("fileio",
-			zap.Uint32("pid", e.PID), zap.String("comm", e.CommString()),
-			zap.String("op", e.OpString()), zap.Uint64("bytes", e.Bytes),
-			zap.String("latency", fmtDuration(e.LatencyNs)),
-			zap.String("ns", ns), zap.String("pod", pod))
-	}))
-
-	a.Register(drop.New(logger, func(e drop.Event) {
-		m.ObservePacketDrop(e.DropReasonString(), cfg.NodeName)
-		logger.Warn("packet_drop",
-			zap.Uint32("pid", e.PID), zap.String("comm", e.CommString()),
-			zap.String("reason", e.DropReasonString()))
-	}))
-
-	// ─── Run agent ─────────────────────────────────────────────
+	// ─── Run (Facade pattern) ──────────────────────────────────
 	ctx, cancel := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	if err := a.Run(ctx); err != nil && ctx.Err() == nil {
-		logger.Fatal("Agent error", zap.Error(err))
-	}
-}
-
-func fmtDuration(ns uint64) string {
-	d := time.Duration(ns) * time.Nanosecond
-	switch {
-	case d < time.Millisecond:
-		return fmt.Sprintf("%.1fµs", float64(d)/float64(time.Microsecond))
-	case d < time.Second:
-		return fmt.Sprintf("%.2fms", float64(d)/float64(time.Millisecond))
-	default:
-		return fmt.Sprintf("%.3fs", float64(d)/float64(time.Second))
+	if err := rt.Run(ctx); err != nil && ctx.Err() == nil {
+		logger.Fatal("Runtime error", zap.Error(err))
 	}
 }
