@@ -2,7 +2,7 @@
 
 // KubePulse DNS Tracer - eBPF Program
 // Hooks udp_sendmsg to capture DNS queries (port 53).
-// Parses DNS wire format query name with explicit bounds checking.
+// Parses DNS wire format query name with BPF-verifier-safe bounds checking.
 
 #include "headers/vmlinux.h"
 #include <bpf/bpf_core_read.h>
@@ -10,31 +10,27 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
-// Maximum DNS query name length per RFC 1035
-#define MAX_DNS_NAME_LEN 256
+// Maximum DNS query name length
+#define MAX_DNS_NAME_LEN 128
 // DNS header size
 #define DNS_HEADER_SIZE 12
 // Ring buffer size: 2MB
 #define RINGBUF_SIZE (2 * 1024 * 1024)
-// Max entries for DNS start time tracking
-#define MAX_DNS_ENTRIES 32768
 
 // DNS event emitted to userspace
 struct dns_event {
   __u32 pid;
   __u32 uid;
-  __u32 saddr;      // Source IPv4 address
-  __u32 daddr;      // Destination IPv4 address (DNS server)
-  __u16 sport;      // Source port
-  __u16 dport;      // Destination port (should be 53)
-  __u64 latency_ns; // Not used in the sendmsg-only path; reserved for future
-                    // recv hook
-  __u64 timestamp;  // Kernel timestamp
-  char qname[MAX_DNS_NAME_LEN]; // DNS query name (dot-separated,
-                                // null-terminated)
-  __u16 qname_len;              // Length of query name string
-  char comm[16];                // Process command name
-  __u8 _pad[6];                 // Padding for 8-byte alignment
+  __u32 saddr;
+  __u32 daddr;
+  __u16 sport;
+  __u16 dport;
+  __u64 latency_ns;
+  __u64 timestamp;
+  char qname[MAX_DNS_NAME_LEN];
+  __u16 qname_len;
+  char comm[16];
+  __u8 _pad[6];
 };
 
 // Ring buffer for emitting DNS events to userspace
@@ -43,79 +39,67 @@ struct {
   __uint(max_entries, RINGBUF_SIZE);
 } dns_events SEC(".maps");
 
-// parse_dns_name: Safely parse DNS wire format name into dot-separated string.
-// DNS wire format: [3]www[6]google[3]com[0]
-// Output: "www.google.com"
-//
-// Safety: All reads use bpf_probe_read_user with explicit bounds.
-// Returns the number of bytes written to dst, or 0 on failure.
-static __always_inline int parse_dns_name(const unsigned char *dns_data,
-                                          int data_len, char *dst,
+// parse_dns_name parses a DNS wire format name from a stack buffer into
+// dot-separated human-readable form. All accesses are from the stack buffer,
+// so no bpf_probe_read is needed. Uses bounded loops (kernel 5.3+).
+static __always_inline int parse_dns_name(const unsigned char *payload,
+                                          int payload_len, char *dst,
                                           int dst_len) {
   int src_pos = 0;
   int dst_pos = 0;
-  int label_len;
 
-// DNS name consists of labels: [len][chars...][len][chars...]...[0]
-// Maximum iterations to prevent BPF verifier from complaining about unbounded
-// loops
-#pragma unroll
-  for (int i = 0; i < 128; i++) {
-    if (src_pos >= data_len || src_pos >= 255) {
+  // Outer loop: iterate over labels. Max 32 labels is generous for any domain.
+  // No #pragma unroll — kernel 5.3+ supports bounded loops natively.
+  for (int i = 0; i < 32; i++) {
+    if (src_pos >= payload_len || src_pos >= dst_len)
       break;
-    }
 
-    // Read label length
-    unsigned char llen = 0;
-    if (bpf_probe_read_user(&llen, 1, dns_data + src_pos) != 0) {
+    unsigned char llen = payload[src_pos];
+    if (llen == 0)
       break;
-    }
 
-    label_len = llen;
-
-    // End of name
-    if (label_len == 0) {
+    // Compression pointer or invalid
+    if (llen >= 0xC0)
       break;
-    }
 
-    // Compression pointer (starts with 0xC0) - we don't follow these
-    if (label_len >= 0xC0) {
+    // Cap label length — DNS max is 63, we cap at 32 for verifier
+    int label_len = llen;
+    if (label_len > 32)
       break;
-    }
 
-    // Bounds check: label_len must fit in remaining source data
-    if (src_pos + 1 + label_len > data_len || src_pos + 1 + label_len > 255) {
+    // Check source bounds
+    if (src_pos + 1 + label_len > payload_len)
       break;
-    }
 
     // Add dot separator (not before first label)
-    if (dst_pos > 0) {
-      if (dst_pos >= dst_len - 1) {
-        break;
-      }
+    if (dst_pos > 0 && dst_pos < dst_len - 1) {
       dst[dst_pos] = '.';
       dst_pos++;
     }
 
-    // Bounds check: ensure we have room in destination
-    if (dst_pos + label_len >= dst_len - 1) {
+    // Check destination bounds
+    if (dst_pos + label_len >= dst_len - 1)
       break;
+
+    // Copy label characters one by one (verifier can track bounds)
+    for (int j = 0; j < 32; j++) {
+      if (j >= label_len)
+        break;
+      if (dst_pos >= dst_len - 1)
+        break;
+      int src_idx = src_pos + 1 + j;
+      if (src_idx >= payload_len || src_idx >= MAX_DNS_NAME_LEN)
+        break;
+      dst[dst_pos] = payload[src_idx];
+      dst_pos++;
     }
 
-    // Read label characters
-    if (bpf_probe_read_user(dst + dst_pos, label_len, dns_data + src_pos + 1) !=
-        0) {
-      break;
-    }
-
-    dst_pos += label_len;
     src_pos += 1 + label_len;
   }
 
   // Null-terminate
-  if (dst_pos < dst_len) {
+  if (dst_pos < dst_len)
     dst[dst_pos] = '\0';
-  }
 
   return dst_pos;
 }
@@ -142,12 +126,10 @@ int kprobe_udp_sendmsg(struct pt_regs *ctx) {
   __u64 uid_gid = bpf_get_current_uid_gid();
 
   // Get the iov_iter from msghdr to read DNS payload
-  // The DNS query starts after the 12-byte DNS header
   struct iov_iter iter;
   if (bpf_probe_read_kernel(&iter, sizeof(iter), &msg->msg_iter) != 0)
     return 0;
 
-  // Read the first iovec
   const struct iovec *iov = NULL;
   if (bpf_probe_read_kernel(&iov, sizeof(iov), &iter.__iov) != 0)
     return 0;
@@ -162,13 +144,25 @@ int kprobe_udp_sendmsg(struct pt_regs *ctx) {
   if (bpf_probe_read_kernel(&iov_len, sizeof(iov_len), &iov->iov_len) != 0)
     return 0;
 
-  // Minimum DNS message is header (12 bytes) + 1 byte name + 4 bytes (qtype +
-  // qclass)
+  // Minimum DNS message: header (12) + 1 byte name + 4 bytes qtype/qclass
   if (!base || iov_len < DNS_HEADER_SIZE + 5 || iov_len > 512)
     return 0;
 
+  // Read the raw DNS payload after the header into a stack buffer.
+  unsigned char dns_payload[MAX_DNS_NAME_LEN];
+  int payload_len = iov_len - DNS_HEADER_SIZE;
+  if (payload_len <= 0)
+    return 0;
+  if (payload_len > MAX_DNS_NAME_LEN)
+    payload_len = MAX_DNS_NAME_LEN;
+
+  if (bpf_probe_read_user(dns_payload, payload_len & 0x7F,
+                          (void *)base + DNS_HEADER_SIZE) != 0)
+    return 0;
+
   // Reserve ring buffer space
-  struct dns_event *event = bpf_ringbuf_reserve(&dns_events, sizeof(*event), 0);
+  struct dns_event *event =
+      bpf_ringbuf_reserve(&dns_events, sizeof(struct dns_event), 0);
   if (!event)
     return 0;
 
@@ -176,7 +170,7 @@ int kprobe_udp_sendmsg(struct pt_regs *ctx) {
   event->pid = pid;
   event->uid = uid_gid & 0xFFFFFFFF;
   event->timestamp = bpf_ktime_get_ns();
-  event->latency_ns = 0; // No response tracking in this hook
+  event->latency_ns = 0;
   event->dport = dport;
 
   BPF_CORE_READ_INTO(&event->saddr, sk, __sk_common.skc_rcv_saddr);
@@ -185,15 +179,10 @@ int kprobe_udp_sendmsg(struct pt_regs *ctx) {
 
   bpf_get_current_comm(&event->comm, sizeof(event->comm));
 
-  // Parse DNS query name from the payload (starts at offset 12, after DNS
-  // header)
-  int dns_data_len = iov_len - DNS_HEADER_SIZE;
-  if (dns_data_len > 255)
-    dns_data_len = 255;
-
-  event->qname_len =
-      parse_dns_name((const unsigned char *)base + DNS_HEADER_SIZE,
-                     dns_data_len, event->qname, MAX_DNS_NAME_LEN);
+  // Parse DNS wire format from stack buffer
+  int name_len = parse_dns_name(dns_payload, payload_len & 0x7F, event->qname,
+                                MAX_DNS_NAME_LEN);
+  event->qname_len = (__u16)name_len;
 
   bpf_ringbuf_submit(event, 0);
   return 0;
